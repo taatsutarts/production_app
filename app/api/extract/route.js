@@ -15,62 +15,96 @@ const MODELS = [
   "gemini-3.5-flash",
   "gemini-flash-latest",
 ];
+const OPENING_CATEGORIES = ["TARTS"]; // add "MINIS" if wanted
+
+// sends photo + instructions to Gemini; tries the next model if one is busy
+async function ask(prompt, mimeType, base64) {
+  let lastError;
+  for (const model of MODELS) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: [
+          { inlineData: { mimeType, data: base64 } },
+          { text: prompt },
+        ],
+        config: { responseMimeType: "application/json" },
+      });
+      return JSON.parse(response.text);
+    } catch (err) {
+      console.log(model + " failed: " + err.message);
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
 
 export async function POST(request) {
   try {
-    // 1. get the master item names from the database
+    // 1. master names from the database
     const { data: master, error } = await supabase
       .from("items")
-      .select("item_name")
+      .select("item_name, category")
       .order("id");
     if (error) throw error;
     const names = master.map((i) => i.item_name);
 
-    // 2. build the instructions, including the master list
-    const prompt = `This is a production board photo.
-Read the date at the top-left (format YYYY-MM-DD).
-Read ONLY the Production column.
-Skip items with no quantity written.
-For each item, choose the matching name from this MASTER LIST and return it EXACTLY as written there:
-${names.join("\n")}
-If an item matches nothing in the list, return the board text as is.
-Return JSON only: {"date": "YYYY-MM-DD", "items": [{"item_name": "...", "qty": 0}]}`;
-
-    // 3. read the photo
+    // 2. read the photo
     const form = await request.formData();
     const file = form.get("image");
     const base64 = Buffer.from(await file.arrayBuffer()).toString("base64");
 
-    // 4. ask Gemini (tries the next model if one is busy)
-    let lastError;
-    for (const model of MODELS) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: [
-            { inlineData: { mimeType: file.type, data: base64 } },
-            { text: prompt },
-          ],
-          config: { responseMimeType: "application/json" },
-        });
-        const data = JSON.parse(response.text);
+    // 3. one prompt: read every row, all columns
+    const prompt = `This is a photo of a production board with TWO tables side by side.
+Read the date at the top-left (format YYYY-MM-DD).
+Read EVERY row that has a product name and at least one handwritten number.
+LEFT table columns, in order: Product Name, Wastage, Open, Target, Production, Filling Box.
+RIGHT table columns, in order: Product Name, Yield, Open, Target, Production, Wastage.
+Copy numbers exactly as handwritten. Use null for an empty cell. A written 0 is 0, not null.
+For each row, set "master_name" to the matching name from this MASTER LIST (exactly as written there), or null if nothing matches:
+${names.join("\n")}
+Return JSON only:
+{"date": "YYYY-MM-DD",
+ "left": [{"board_name": "...", "master_name": "...", "wastage": null, "open": 0, "target": null, "production": 0}],
+ "right": [{"board_name": "...", "master_name": "...", "yield": null, "open": null, "target": null, "production": 0, "wastage": null}]}`;
 
-        // 5. snap each name to the exact master name (ignores capitals)
-        const lower = {};
-        names.forEach((n) => (lower[n.toLowerCase()] = n));
-        data.items = data.items.map((i) => {
-          const exact = lower[String(i.item_name).trim().toLowerCase()];
-          return exact
-            ? { ...i, item_name: exact }
-            : { ...i, item_name: "??? " + i.item_name };
-        });
-        return NextResponse.json(data);
-      } catch (err) {
-        console.log(model + " failed: " + err.message);
-        lastError = err;
+    const data = await ask(prompt, file.type, base64);
+    console.log("RAW:", JSON.stringify(data));
+
+    // 4. helpers
+    const lookup = {};
+    names.forEach((n) => (lookup[n.toLowerCase()] = n));
+    const categoryOf = {};
+    master.forEach(
+      (m) => (categoryOf[m.item_name] = String(m.category).trim().toUpperCase())
+    );
+    const key = (n) => String(n ?? "").trim().toLowerCase();
+    const has = (v) => v !== null && v !== undefined && v !== "";
+
+    // 5. the code decides: Production from both tables, Opening for tarts only
+    const rows = {};
+    [...(data.left || []), ...(data.right || [])].forEach((r) => {
+      const exact = lookup[key(r.master_name)];
+      const name = exact || "??? " + r.board_name;
+      const row = rows[name] || { item_name: name, opening: "", production: "" };
+
+      if (has(r.production)) row.production = r.production;
+      if (has(r.open) && exact && OPENING_CATEGORIES.includes(categoryOf[exact])) {
+        row.opening = r.open;
       }
-    }
-    throw lastError;
+      if (row.production !== "" || row.opening !== "") rows[name] = row;
+    });
+
+    // keep the same order as your items table
+    const order = (n) => {
+      const k = names.indexOf(n);
+      return k === -1 ? 9999 : k;
+    };
+    const merged = Object.values(rows).sort(
+      (a, b) => order(a.item_name) - order(b.item_name)
+    );
+
+    return NextResponse.json({ date: data.date, rows: merged });
   } catch (err) {
     console.error(err);
     return NextResponse.json({ error: err.message }, { status: 500 });

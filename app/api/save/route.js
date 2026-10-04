@@ -7,11 +7,11 @@ const supabase = createClient(
 );
 
 export async function POST(request) {
-  const { date, items } = await request.json();
+  const { date, items, opening = [] } = await request.json();
 
-  const clean = items.filter(
-    (i) => i.item_name && i.qty !== "" && i.qty != null
-  );
+  const hasQty = (i) => i.item_name && i.qty !== "" && i.qty != null;
+  const prod = items.filter(hasQty);
+  const open = opening.filter(hasQty);
 
   // look up ids (no new items are ever created)
   const { data: master, error: e1 } = await supabase
@@ -21,10 +21,11 @@ export async function POST(request) {
 
   const idByName = {};
   master.forEach((m) => (idByName[m.item_name.toLowerCase()] = m.id));
+  const idOf = (n) => idByName[n.trim().toLowerCase()];
 
   // stop if any name is not in the master list
-  const unknown = clean
-    .filter((i) => !idByName[i.item_name.trim().toLowerCase()])
+  const unknown = [...prod, ...open]
+    .filter((i) => !idOf(i.item_name))
     .map((i) => i.item_name);
   if (unknown.length) {
     return NextResponse.json(
@@ -33,15 +34,29 @@ export async function POST(request) {
     );
   }
 
-  const rows = clean.map((i) => ({
-    production_date: date,
-    item_id: idByName[i.item_name.trim().toLowerCase()],
-    production_qty: Number(i.qty),
-  }));
-  const { error: e2 } = await supabase
-    .from("production")
-    .upsert(rows, { onConflict: "production_date,item_id" });
-  if (e2) return NextResponse.json({ error: e2.message }, { status: 500 });
+  if (prod.length) {
+    const { error } = await supabase.from("production").upsert(
+      prod.map((i) => ({
+        production_date: date,
+        item_id: idOf(i.item_name),
+        production_qty: Number(i.qty),
+      })),
+      { onConflict: "production_date,item_id" }
+    );
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  if (open.length) {
+    const { error } = await supabase.from("physical_opening").upsert(
+      open.map((i) => ({
+        opening_date: date,
+        item_id: idOf(i.item_name),
+        opening_qty: Number(i.qty),
+      })),
+      { onConflict: "opening_date,item_id" }
+    );
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  }
 
   return NextResponse.json({ ok: true });
 }

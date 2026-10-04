@@ -4,14 +4,15 @@ import { useState } from "react";
 export default function Production() {
   const [file, setFile] = useState(null);
   const [date, setDate] = useState("");
-  const [items, setItems] = useState([]);
+  const [rows, setRows] = useState([]);
   const [msg, setMsg] = useState("");
   const [over, setOver] = useState(false);
 
   function pick(f) {
     if (f && f.type.startsWith("image/")) {
       setFile(f);
-      setItems([]);
+      setRows([]);
+      setDate("");
       setMsg("");
     } else {
       setMsg("Please choose an image.");
@@ -37,26 +38,40 @@ export default function Production() {
       }
       const data = JSON.parse(text);
       setDate(data.date || "");
-      setItems(data.items || []);
-      setMsg("Check and edit, then save.");
+      setRows(data.rows || []);
+      const nOpen = (data.rows || []).filter((r) => r.opening !== "").length;
+      const nProd = (data.rows || []).filter((r) => r.production !== "").length;
+      setMsg(
+        (data.openingFailed ? "Opening failed (Gemini busy), upload again. " : "") +
+          "Production: " + nProd + ", Opening: " + nOpen +
+          ". Check, edit, then save."
+      );
     } catch (err) {
       setMsg("Failed: " + err.message);
     }
   }
 
   function edit(i, field, value) {
-    const copy = [...items];
+    const copy = [...rows];
     copy[i] = { ...copy[i], [field]: value };
-    setItems(copy);
+    setRows(copy);
   }
 
   async function save() {
     try {
       setMsg("Saving...");
+      const has = (v) => v !== "" && v != null;
+      const items = rows
+        .filter((r) => has(r.production))
+        .map((r) => ({ item_name: r.item_name, qty: r.production }));
+      const opening = rows
+        .filter((r) => has(r.opening))
+        .map((r) => ({ item_name: r.item_name, qty: r.opening }));
+
       const res = await fetch("/api/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date, items }),
+        body: JSON.stringify({ date, items, opening }),
       });
       const data = await res.json();
       setMsg(res.ok ? "Saved!" : "Save failed: " + data.error);
@@ -66,7 +81,7 @@ export default function Production() {
   }
 
   return (
-    <main className="p-4 max-w-md mx-auto space-y-3">
+    <main className="p-3 max-w-2xl mx-auto space-y-3">
       <label
         onDragOver={(e) => {
           e.preventDefault();
@@ -100,27 +115,54 @@ export default function Production() {
         Upload
       </button>
 
-      {items.length > 0 && (
+      {rows.length > 0 && (
         <>
           <input
             value={date}
             onChange={(e) => setDate(e.target.value)}
             className="border p-2 w-full"
           />
-          {items.map((it, i) => (
-            <div key={i} className="flex gap-2">
-              <input
-                value={it.item_name}
-                onChange={(e) => edit(i, "item_name", e.target.value)}
-                className="border p-2 flex-1"
-              />
-              <input
-                value={it.qty}
-                onChange={(e) => edit(i, "qty", e.target.value)}
-                className="border p-2 w-20"
-              />
-            </div>
-          ))}
+
+          <table className="w-full border-collapse text-sm">
+            <thead>
+              <tr className="bg-gray-100">
+                <th className="border p-1 text-left">Item</th>
+                <th className="border p-1 w-16">Opening</th>
+                <th className="border p-1 w-16">Prod.</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={i} className={r.item_name.startsWith("???") ? "bg-red-100" : ""}>
+                  <td className="border p-0">
+                    <textarea
+                      rows={2}
+                      value={r.item_name}
+                      onChange={(e) => edit(i, "item_name", e.target.value)}
+                      className="w-full p-1 text-xs resize-none bg-transparent"
+                    />
+                  </td>
+                  <td className="border p-0">
+                    <input
+                      value={r.opening}
+                      inputMode="decimal"
+                      onChange={(e) => edit(i, "opening", e.target.value)}
+                      className="w-full p-1 text-center bg-transparent"
+                    />
+                  </td>
+                  <td className="border p-0">
+                    <input
+                      value={r.production}
+                      inputMode="decimal"
+                      onChange={(e) => edit(i, "production", e.target.value)}
+                      className="w-full p-1 text-center bg-transparent"
+                    />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
           <button onClick={save} className="bg-green-600 text-white px-4 py-2 rounded">
             Save
           </button>
