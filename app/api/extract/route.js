@@ -1,6 +1,9 @@
 import { GoogleGenAI } from "@google/genai";
+import sharp from "sharp";
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
+
+export const maxDuration = 60;
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const supabase = createClient(
@@ -8,20 +11,17 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-const MODELS = [
-  "gemini-3.8-flash",
-  "gemini-3.7-flash",
-  "gemini-3.6-flash",
-  "gemini-3.5-flash",
-  "gemini-flash-latest",
-];
+// only 2 models, so failed tries don't use up your free quota
+// const MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+const MODELS = ["gemini-flash-latest", "gemini-3.5-flash-lite"];
 const OPENING_CATEGORIES = ["TARTS"]; // add "MINIS" if wanted
 
-// sends photo + instructions to Gemini; tries the next model if one is busy
+// sends photo + instructions to Gemini; tries the next model if one fails
 async function ask(prompt, mimeType, base64) {
   let lastError;
   for (const model of MODELS) {
     try {
+      console.log("trying " + model);
       const response = await ai.models.generateContent({
         model,
         contents: [
@@ -49,10 +49,15 @@ export async function POST(request) {
     if (error) throw error;
     const names = master.map((i) => i.item_name);
 
-    // 2. read the photo
+    // 2. read the photo and shrink it
     const form = await request.formData();
     const file = form.get("image");
-    const base64 = Buffer.from(await file.arrayBuffer()).toString("base64");
+    const small = await sharp(Buffer.from(await file.arrayBuffer()))
+      .rotate()
+      .resize({ width: 1600, withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+    const base64 = small.toString("base64");
 
     // 3. one prompt: read every row, all columns
     const prompt = `This is a photo of a production board with TWO tables side by side.
@@ -68,7 +73,7 @@ Return JSON only:
  "left": [{"board_name": "...", "master_name": "...", "wastage": null, "open": 0, "target": null, "production": 0}],
  "right": [{"board_name": "...", "master_name": "...", "yield": null, "open": null, "target": null, "production": 0, "wastage": null}]}`;
 
-    const data = await ask(prompt, file.type, base64);
+    const data = await ask(prompt, "image/jpeg", base64);
     console.log("RAW:", JSON.stringify(data));
 
     // 4. helpers
