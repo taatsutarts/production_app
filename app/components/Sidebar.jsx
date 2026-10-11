@@ -32,7 +32,8 @@ const NAV = [
    ],
   },
 
-  // { href: "/dispatch", label: "Dispatch", icon: "📈" },
+  { href: "/dispatches", label: "Dispatches", icon: "📈" },
+  { href: "/dispatch_tracker", label: "Dispatch Tracker", icon: "📈" },
 
     {
   label: "Supplies Dispatches",

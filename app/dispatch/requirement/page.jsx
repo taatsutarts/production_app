@@ -37,7 +37,7 @@ export default function RequirementsPage() {
         supabase.from("supplies").select("id,product_title,base_unit").order("id"),
         supabase.from("outlet_requirements").select("outlet_id,supply_id,monthly_qty"),
         supabase
-          .from("dispatch_log")
+          .from("supplies_dispatch_log")
           .select("outlet_id,supply_id,qty")
           .gte("dispatched_at", monthStart),
       ]);

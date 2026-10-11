@@ -28,7 +28,7 @@ export default function DispatchPage() {
     const d = new Date();
     const monthStart = new Date(d.getFullYear(), d.getMonth(), 1).toISOString();
     const { data } = await supabase
-      .from("dispatch_log")
+      .from("supplies_dispatch_log")
       .select("outlet_id,supply_id,qty")
       .gte("dispatched_at", monthStart);
     const sm = {};
@@ -62,7 +62,7 @@ export default function DispatchPage() {
     })();
   }, []);
 
-  const store = stores.find((s) => s.id === outletId);
+  const store = stores.find((s) => String(s.id) === outletId);
   const lines = useMemo(
     () =>
       supplies
@@ -95,7 +95,7 @@ export default function DispatchPage() {
       const at = date === todayStr() ? now.toISOString() : new Date(`${date}T12:00:00`).toISOString();
 
       // log first so a PDF never goes out without a record
-      const { error } = await supabase.from("dispatch_log").insert(
+      const { error } = await supabase.from("supplies_dispatch_log").insert(
         lines.map((l) => ({
           challan_no: challanNo,
           outlet_id: store.id,
