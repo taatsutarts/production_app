@@ -29,8 +29,21 @@ const NAV = [
     { href: "/shipment-planning/send", label: "Send to Outlet" },
     { href: "/shipment-planning/trend", label: "Outlet Stock Trend" },
     { href: "/shipment-planning/plan", label: "Plan Shipment" },
-  ],
-},
+   ],
+  },
+
+  // { href: "/dispatch", label: "Dispatch", icon: "📈" },
+
+    {
+  label: "Supplies Dispatches",
+  icon: "🚛",
+  base: "/dispatch",
+  children: [
+    { href: "/dispatch/challan", label: "Generage Supplies Challan" },
+    { href: "/dispatch/requirement", label: "Supplies Monthly Req" },
+   ],
+  },
+  
 ];
 
 export default function Sidebar() {

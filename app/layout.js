@@ -1,6 +1,8 @@
 import "./globals.css";
 import Sidebar from "./components/Sidebar";
 
+export const preferredRegion = "sin1";
+
 export const metadata = {
   title: "Taatsu Production & Shipment",
 };
