@@ -41,12 +41,12 @@ export async function POST(req) {
 
   const [outletsRes, itemsRes, purchaseRes] = await Promise.all([
     supabase.from("outlets").select("id, name"),
-    supabase.from("items").select("id, name"),
-    supabase.from("purchase_items").select("id, name"),
+    supabase.from("items").select("id, item_name"),
+    supabase.from("purchase_items").select("id, item_name"),
   ]);
 
-  if (outletsRes.error || itemsRes.error || purchaseRes.error) {
-    const err = outletsRes.error || itemsRes.error || purchaseRes.error;
+  const err = outletsRes.error || itemsRes.error || purchaseRes.error;
+  if (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 
@@ -55,12 +55,12 @@ export async function POST(req) {
     return NextResponse.json({ error: `Unknown outlet: ${location}` }, { status: 422 });
   }
 
-  const itemMap = new Map(itemsRes.data.map((i) => [norm(i.name), i.id]));
-  const purchaseMap = new Map(purchaseRes.data.map((i) => [norm(i.name), i.id]));
+  const itemMap = new Map(itemsRes.data.map((i) => [norm(i.item_name), i.id]));
+  const purchaseMap = new Map(purchaseRes.data.map((i) => [norm(i.item_name), i.id]));
 
+  const when = dispatchedAt ? new Date(dispatchedAt).toISOString() : new Date().toISOString();
   const unknown = [];
   const rows = [];
-  const when = dispatchedAt ? new Date(dispatchedAt).toISOString() : new Date().toISOString();
 
   for (const i of items) {
     const key = norm(i.name);
