@@ -101,7 +101,7 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-gray-100 p-4">
+    <main className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-gray-100 p-4">
       <form
         onSubmit={handleSubmit}
         className="flex w-full max-w-sm flex-col gap-4 rounded-xl bg-white p-7 shadow-lg"

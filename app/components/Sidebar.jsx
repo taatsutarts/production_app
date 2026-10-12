@@ -1,7 +1,8 @@
 "use client";
 import { useState } from "react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
+import { createClient } from "../lib/supabase/client";
 
 const NAV = [
   { href: "/", label: "Home", icon: "🏠" },
@@ -20,37 +21,44 @@ const NAV = [
       { href: "/Kytchens_current_stock/by-outlet", label: "Stock by Outlet" },
     ],
   },
-
   {
-  label: "Shipment Planning",
-  icon: "🚚",
-  base: "/shipment-planning",
-  children: [
-    { href: "/shipment-planning/send", label: "Send to Outlet" },
-    { href: "/shipment-planning/trend", label: "Outlet Stock Trend" },
-    { href: "/shipment-planning/plan", label: "Plan Shipment" },
-   ],
+    label: "Shipment Planning",
+    icon: "🚚",
+    base: "/shipment-planning",
+    children: [
+      { href: "/shipment-planning/send", label: "Send to Outlet" },
+      { href: "/shipment-planning/trend", label: "Outlet Stock Trend" },
+      { href: "/shipment-planning/plan", label: "Plan Shipment" },
+    ],
   },
-
   { href: "/dispatches", label: "Dispatches", icon: "📈" },
   { href: "/dispatch_tracker", label: "Dispatch Tracker", icon: "📈" },
-
-    {
-  label: "Supplies Dispatches",
-  icon: "🚛",
-  base: "/dispatch",
-  children: [
-    { href: "/dispatch/challan", label: "Generage Supplies Challan" },
-    { href: "/dispatch/requirement", label: "Supplies Monthly Req" },
-   ],
+  {
+    label: "Supplies Dispatches",
+    icon: "🚛",
+    base: "/dispatch",
+    children: [
+      { href: "/dispatch/challan", label: "Generage Supplies Challan" },
+      { href: "/dispatch/requirement", label: "Supplies Monthly Req" },
+    ],
   },
-  
 ];
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState({});
+
+  // must stay AFTER all hooks
+  if (pathname === "/login") return null;
+
+  async function handleLogout() {
+    await createClient().auth.signOut();
+    setOpen(false);
+    router.push("/login");
+    router.refresh();
+  }
 
   const isActive = (href) =>
     href === "/" ? pathname === "/" : pathname.startsWith(href);
@@ -94,7 +102,6 @@ export default function Sidebar() {
 
         <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
           {NAV.map((item) => {
-            // normal button
             if (!item.children) {
               return (
                 <Link
@@ -109,7 +116,6 @@ export default function Sidebar() {
               );
             }
 
-            // button with sub buttons
             const groupActive = pathname.startsWith(item.base);
             const isOpen = expanded[item.label] ?? groupActive;
 
@@ -151,8 +157,15 @@ export default function Sidebar() {
           })}
         </nav>
 
-        <div className="border-t border-slate-800 px-6 py-4 text-xs text-slate-500">
-          v1.0
+        <div className="border-t border-slate-800 px-3 py-3">
+          <button
+            onClick={handleLogout}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors hover:bg-slate-800 hover:text-white"
+          >
+            <span className="text-base">🚪</span>
+            Log out
+          </button>
+          <p className="px-3 pt-2 text-xs text-slate-500">v1.0</p>
         </div>
       </aside>
     </>
