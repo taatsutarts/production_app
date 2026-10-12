@@ -4,7 +4,17 @@ import { NextResponse } from 'next/server'
 // Pages that logged-out visitors are allowed to see
 const PUBLIC_PATHS = ['/login']
 
+// API routes that do their own auth (bearer secret), so skip the login check
+const SELF_AUTH_PATHS = ['/api/dispatch_import']
+
 export async function proxy(request) {
+  const { pathname } = request.nextUrl
+
+  // Let the dispatch webhook through; the route itself verifies the secret
+  if (SELF_AUTH_PATHS.some((p) => pathname.startsWith(p))) {
+    return NextResponse.next()
+  }
+
   let response = NextResponse.next({ request })
 
   const supabase = createServerClient(
@@ -29,7 +39,6 @@ export async function proxy(request) {
     data: { user },
   } = await supabase.auth.getUser()
 
-  const { pathname } = request.nextUrl
   const isPublic = PUBLIC_PATHS.some((p) => pathname.startsWith(p))
 
   // Logged out and trying to open a protected page -> send to /login

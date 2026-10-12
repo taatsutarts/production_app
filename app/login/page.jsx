@@ -108,7 +108,7 @@ export default function LoginPage() {
       >
         <div>
           <h1 className="text-2xl font-bold text-gray-900">
-            {isLogin ? 'Welcome back' : 'Create your account'}
+            {isLogin ? 'Welcome back Taatsu' : 'Create your account'}
           </h1>
           <p className="mt-1 text-sm text-gray-500">
             {isLogin ? 'Log in to continue' : 'Sign up with your email and a password'}
