@@ -39,13 +39,14 @@ export async function POST(req) {
     return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
   }
 
-  const [outletsRes, itemsRes, purchaseRes] = await Promise.all([
+  const [outletsRes, itemsRes, purchaseRes, aliasRes] = await Promise.all([
     supabase.from("outlets").select("id, name"),
     supabase.from("items").select("id, item_name"),
     supabase.from("purchase_items").select("id, item_name"),
+    supabase.from("item_aliases").select("item_id, alias"),
   ]);
 
-  const err = outletsRes.error || itemsRes.error || purchaseRes.error;
+  const err = outletsRes.error || itemsRes.error || purchaseRes.error || aliasRes.error;
   if (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
@@ -55,6 +56,7 @@ export async function POST(req) {
     return NextResponse.json({ error: `Unknown outlet: ${location}` }, { status: 422 });
   }
 
+  const aliasMap = new Map(aliasRes.data.map((a) => [norm(a.alias), a.item_id]));
   const itemMap = new Map(itemsRes.data.map((i) => [norm(i.item_name), i.id]));
   const purchaseMap = new Map(purchaseRes.data.map((i) => [norm(i.item_name), i.id]));
 
@@ -64,7 +66,7 @@ export async function POST(req) {
 
   for (const i of items) {
     const key = norm(i.name);
-    const itemId = itemMap.get(key);
+    const itemId = aliasMap.get(key) ?? itemMap.get(key);
     const purchaseId = purchaseMap.get(key);
 
     if (itemId === undefined && purchaseId === undefined) {
