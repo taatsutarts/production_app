@@ -39,19 +39,32 @@ export async function POST(req) {
     return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
   }
 
-  const [outletsRes, itemsRes, purchaseRes, aliasRes] = await Promise.all([
+  const [outletsRes, outletAliasRes, itemsRes, purchaseRes, aliasRes] = await Promise.all([
     supabase.from("outlets").select("id, name"),
+    supabase.from("outlet_aliases").select("outlet_id, alias"),
     supabase.from("items").select("id, item_name"),
     supabase.from("purchase_items").select("id, item_name"),
     supabase.from("item_aliases").select("item_id, alias"),
   ]);
 
-  const err = outletsRes.error || itemsRes.error || purchaseRes.error || aliasRes.error;
+  const err =
+    outletsRes.error ||
+    outletAliasRes.error ||
+    itemsRes.error ||
+    purchaseRes.error ||
+    aliasRes.error;
   if (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 
-  const outlet = outletsRes.data.find((o) => norm(o.name) === norm(location));
+  // Outlet: exact name first, then alias
+  const outletAliasMap = new Map(
+    outletAliasRes.data.map((a) => [norm(a.alias), a.outlet_id])
+  );
+  const outlet =
+    outletsRes.data.find((o) => norm(o.name) === norm(location)) ??
+    outletsRes.data.find((o) => o.id === outletAliasMap.get(norm(location)));
+
   if (!outlet) {
     return NextResponse.json({ error: `Unknown outlet: ${location}` }, { status: 422 });
   }
