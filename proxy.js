@@ -5,7 +5,7 @@ import { NextResponse } from 'next/server'
 const PUBLIC_PATHS = ['/login']
 
 // API routes that do their own auth (bearer secret), so skip the login check
-const SELF_AUTH_PATHS = ['/api/dispatch_import']
+const SELF_AUTH_PATHS = ['/api']
 
 export async function proxy(request) {
   const { pathname } = request.nextUrl
