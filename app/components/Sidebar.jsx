@@ -5,7 +5,9 @@ import { usePathname, useRouter } from "next/navigation";
 import { createClient } from "../lib/supabase/client";
 
 const NAV = [
+
   { href: "/", label: "Home", icon: "🏠" },
+  { href: "/gourmaison/shopify-orders", label: "Shopify-Orders", icon: "🏠" },
   { href: "/production", label: "Production Import with AI", icon: "🏭" },
   { href: "/items", label: "Items", icon: "📋" },
   { href: "/outlets", label: "Outlets", icon: "🏪" },
