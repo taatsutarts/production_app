@@ -8,7 +8,7 @@ const MapView = dynamic(() => import("./MapView"), {
 
 export default function MapsPage() {
   return (
-    <div className="w-full h-[calc(100vh-64px)] min-h-[600px]">
+    <div className="h-[calc(100vh-7.5rem)] min-h-[560px] md:h-[calc(100vh-5rem)]">
       <MapView />
     </div>
   );
