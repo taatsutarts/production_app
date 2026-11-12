@@ -2,7 +2,7 @@
 
 // app/orders/page.jsx  (put it wherever you want the page to live)
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { supabase } from "../../lib/supabase"; // <- change to wherever your Supabase client is exported
 
 /* ---------- formatting helpers ---------- */
@@ -42,7 +42,21 @@ function fmtPhone(p) {
 const itemLine = (i) =>
   `${i.title}${i.variant ? ` - ${i.variant}` : ""} x ${i.qty}`;
 
+// shown instead of the customer's address when an order has no address1
+// (collected at the store) — keep in sync with the popup heading in addressHeading()
+const PICKUP_ADDRESS = [
+  "Gourmaison",
+  "9/11 ground floor Vasundhara building",
+  "Same building as Audi Mumbai South",
+  "Tardeo, Mumbai, Maharashtra 400026",
+];
+
+function addressHeading(o) {
+  return o.address1 ? "Delivery address" : "Pickup Address";
+}
+
 function addressLines(o) {
+  if (!o.address1) return PICKUP_ADDRESS;
   return [
     o.ship_name || o.customer_name,
     o.address1,
@@ -54,15 +68,30 @@ function addressLines(o) {
 }
 
 function dateLine(o) {
-  return [fmtDate(o.delivery_date), o.delivery_day].filter(Boolean).join(", ");
+  return fmtDate(o.delivery_date);
 }
 
+// "#7239" (Shopify order_name) -> "Website Order #7239"
+function orderLabel(o) {
+  return `Website Order ${o.order_name || `#${o.id}`}`;
+}
+
+// "2026-11" -> "November 2026"
+function monthName(key) {
+  if (!key) return "No date";
+  const [y, m] = key.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleString("en", { month: "long", year: "numeric" });
+}
+
+// which month an order belongs to: delivery month decides, placed month as fallback
+const monthKey = (o) => String(o.delivery_date || String(o.placed_at || "").slice(0, 10)).slice(0, 7);
+
 function buildCopyText(o) {
-  const head = [o.customer_name || o.ship_name, dateLine(o), fmtSlot(o.delivery_slot)]
+  const head = [orderLabel(o), o.customer_name || o.ship_name, dateLine(o), fmtSlot(o.delivery_slot)]
     .filter(Boolean)
     .join("\n");
   const items = (o.items || []).map(itemLine).join("\n");
-  const address = ["Delivery address", ...addressLines(o)].join("\n");
+  const address = [addressHeading(o), ...addressLines(o)].join("\n");
   return [head, items, address].filter(Boolean).join("\n\n");
 }
 
@@ -119,6 +148,8 @@ export default function OrdersPage() {
   const [error, setError] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [copied, setCopied] = useState(false);
+  // month filter: null = current month, "YYYY-MM" = that month, "all" = everything
+  const [monthSel, setMonthSel] = useState(null);
 
   const load = useCallback(async () => {
     const { data, error } = await supabase
@@ -178,6 +209,22 @@ export default function OrdersPage() {
   };
 
   const today = todayISO();
+  const thisMonth = today.slice(0, 7);
+  const activeMonth = monthSel || thisMonth;
+
+  // one pill per month that has orders, newest first (with order counts)
+  const monthList = useMemo(() => {
+    const counts = new Map();
+    for (const o of orders) {
+      const k = monthKey(o);
+      counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    return [...counts.entries()].sort((a, b) => b[0].localeCompare(a[0]));
+  }, [orders]);
+
+  // the delivery month decides (an order placed in October but delivering in
+  // November still shows in November); "all" shows every month
+  const visible = orders.filter((o) => (activeMonth === "all" ? true : monthKey(o) === activeMonth));
 
   return (
     <main className="og-page">
@@ -187,8 +234,29 @@ export default function OrdersPage() {
         <h1>Orders</h1>
         {!loading && !error && (
           <p className="og-sub">
-            {orders.length} {orders.length === 1 ? "order" : "orders"}, newest first
+            {visible.length} {visible.length === 1 ? "order" : "orders"}, newest first
           </p>
+        )}
+        {!loading && !error && monthList.length > 0 && (
+          <div className="og-months">
+            {monthList.map(([k, n]) => (
+              <button
+                key={k || "nodate"}
+                type="button"
+                className={`og-pill ${activeMonth === k ? "is-active" : ""}`}
+                onClick={() => setMonthSel(k)}
+              >
+                {monthName(k)} <span>{n}</span>
+              </button>
+            ))}
+            <button
+              type="button"
+              className={`og-pill ${activeMonth === "all" ? "is-active" : ""}`}
+              onClick={() => setMonthSel("all")}
+            >
+              All months
+            </button>
+          </div>
         )}
       </header>
 
@@ -201,24 +269,25 @@ export default function OrdersPage() {
         </p>
       )}
 
-      {!loading && !error && orders.length === 0 && (
+      {!loading && !error && visible.length === 0 && (
         <p className="og-note">
-          No orders yet. New paid orders from Shopify appear here as soon as they arrive.
+          No orders for this month yet. New paid orders from Shopify appear here as soon as they arrive.
         </p>
       )}
 
       <section className="og-grid">
-        {orders.map((o) => (
+        {visible.map((o) => (
           <button
             key={o.id}
             type="button"
             className="og-card"
             onClick={() => openOrder(o.id)}
           >
-            <span className="og-slot">{fmtSlot(o.delivery_slot) || "No slot"}</span>
+            <span className="og-order">{orderLabel(o)}</span>
             <span className="og-name">{o.customer_name || o.ship_name || "Unnamed"}</span>
             <span className="og-date">
               {dateLine(o) || "No delivery date"}
+              {fmtSlot(o.delivery_slot) && <span className="og-date-slot">{fmtSlot(o.delivery_slot)}</span>}
               {o.delivery_date === today && <em className="og-chip">Today</em>}
             </span>
             <span className="og-foot">
@@ -227,7 +296,6 @@ export default function OrdersPage() {
               </span>
               <span className="og-order-no">
                 {o.is_test && <em className="og-chip og-chip-test">Test</em>}
-                {o.order_name}
               </span>
             </span>
           </button>
@@ -240,11 +308,12 @@ export default function OrdersPage() {
             className="og-modal"
             role="dialog"
             aria-modal="true"
-            aria-label={`Order ${selected.order_name || ""}`}
+            aria-label={`Website Order ${selected.order_name || ""}`}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="og-modal-top">
               <div>
+                <p className="og-modal-order">{orderLabel(selected)}</p>
                 <h2>{selected.customer_name || selected.ship_name}</h2>
                 <p className="og-line">{dateLine(selected)}</p>
                 <p className="og-line og-line-slot">{fmtSlot(selected.delivery_slot)}</p>
@@ -282,7 +351,7 @@ export default function OrdersPage() {
             </ul>
 
             <div className="og-address">
-              <h3>Delivery address</h3>
+              <h3>{addressHeading(selected)}</h3>
               {addressLines(selected).map((l, idx) => (
                 <p key={idx}>{l}</p>
               ))}
@@ -339,9 +408,10 @@ const css = `
 .og-card:focus-visible, .og-icon-btn:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px;
 }
-.og-slot { font-family: var(--serif); font-size: 26px; font-weight: 600; color: var(--accent); line-height: 1.1; }
+.og-order { font-family: var(--serif); font-size: 22px; font-weight: 600; color: var(--accent); line-height: 1.15; }
 .og-name { font-size: 16px; font-weight: 600; margin-top: 2px; }
 .og-date { font-size: 14px; color: var(--muted); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.og-date-slot { color: var(--accent); font-weight: 600; }
 .og-foot {
   display: flex; justify-content: space-between; align-items: center; width: 100%;
   margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line);
@@ -355,6 +425,17 @@ const css = `
 }
 .og-chip-test { background: #f1e7c9; color: #7a5d12; }
 
+.og-months { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.og-pill {
+  font-family: var(--sans); font-size: 13px;
+  padding: 7px 14px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer;
+}
+.og-pill span { opacity: 0.6; }
+.og-pill:hover { border-color: var(--accent); }
+.og-pill.is-active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.og-pill.is-active span { opacity: 0.8; }
+
 .og-overlay {
   position: fixed; inset: 0; z-index: 50;
   background: rgba(28, 35, 32, 0.45);
@@ -367,7 +448,8 @@ const css = `
   padding: 24px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
 }
 .og-modal-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
-.og-modal h2 { font-family: var(--serif); font-size: 24px; font-weight: 600; margin: 0 0 6px; line-height: 1.2; }
+.og-modal h2 { font-family: var(--serif); font-size: 24px; font-weight: 400; margin: 0 0 6px; line-height: 1.2; }
+.og-modal-order { margin: 0 0 3px; font-size: 13px; font-weight: 600; color: var(--muted); }
 .og-line { margin: 0; font-size: 15px; color: var(--muted); }
 .og-line-slot { color: var(--accent); font-weight: 600; }
 

@@ -38,6 +38,110 @@
 
 ---
 
+## 2026-11-12 (session 13) — Shopify Orders: no-address1 orders show the pickup address
+
+**Agent:** OpenCode (GLM) · **Status:** Built and verified (headless-Chrome probe + screenshot, zero exceptions).
+
+### What was asked
+If `address1` is null in `shopify_orders`, the popup (and copied text) should show the
+heading **"Pickup Address"** instead of "Delivery address", with the fixed store address:
+"Gourmaison, 9/11 ground floor Vasundhara building, Same building as Audi Mumbai South,
+Tardeo, Mumbai, Maharashtra 400026".
+
+### Changes — `app/gourmaison/shopify-orders/page.jsx` only
+- New `PICKUP_ADDRESS` constant (4 display lines, user's wording verbatim) + new
+  `addressHeading(o)` helper ("Delivery address" / "Pickup Address").
+- `addressLines(o)`: when `!o.address1` (null/empty) → returns `PICKUP_ADDRESS` (customer
+  name/phone lines omitted, per the request); otherwise unchanged.
+- Popup `<h3>` and `buildCopyText` both use `addressHeading()`.
+
+### Data facts (read-only REST probe)
+2 orders have null `address1`, both November deliveries: #7221 Shalin Desai (07/11) and
+#7197 Prerna Jatia (03/11).
+
+### Verification (headless, fresh load, zero exceptions)
+- #7221 popup: heading "Pickup Address", lines exactly the fixed address; copied text:
+  "Website Order #7221 / Shalin Desai / 07/11/2026 / 3PM-5PM / item / **Pickup Address** /
+  Gourmaison / 9/11 ground floor Vasundhara building / Same building as Audi Mumbai South /
+  Tardeo, Mumbai, Maharashtra 400026".
+- #7239 (has address1): heading "Delivery address", customer name + address + phone
+  unchanged.
+- `proxy.js` page-path bypass reverted; route 200; browser + scripts (incl. REST probe) cleaned.
+
+---
+
+## 2026-11-12 (session 12) — Shopify Orders: month pills, copy includes order #, popup name not bold
+
+**Agent:** OpenCode (GLM) · **Status:** Built and verified (headless-Chrome probe + screenshots, zero exceptions).
+
+### What was asked (follow-up to session 11)
+1. An option to see past months' order cards (session 11 hard-filtered to the current month).
+2. The copy-to-clipboard text should start with the popup's top header line
+   ("Website Order #<order_name>").
+3. The popup's customer name is bold — don't want that.
+
+### Changes — `app/gourmaison/shopify-orders/page.jsx` only
+- **Month pills** under the page header: one pill per month that has orders, newest first,
+  each with its order count ("November 2026 43", "October 2026 16") plus "All months".
+  Active pill = filled accent. New state `monthSel` (null = current month, "YYYY-MM",
+  "all"); `monthKey(o)` (delivery month, placed-month fallback) + `monthName()` helpers
+  at module level; `monthList` derived via `useMemo` from `orders` (survives realtime
+  reloads); `visible` filters on the active pill. Header count text follows the selection.
+- **`buildCopyText`**: head now starts with `orderLabel(o)` → copied text begins
+  "Website Order #7239", then name, date, slot, items, address.
+- **Popup `<h2>`** font-weight 600 → 400 (serif, same size — not bold anymore).
+  Card name untouched (only the popup was in scope).
+
+### Verification (headless, fresh load, zero exceptions)
+- Pills render with counts and correct active states; November → 43 cards (all /11/),
+  October → 16 (all /10/ incl. the null-delivery order filed under its placed month),
+  All → 59; count line tracks the selection.
+- Popup: name computed font-weight 400; clipboard intercepted — copied text confirmed:
+  "Website Order #7239\nZeeba Sajnani\n12/11/2026\n3PM-5PM\n\nPlatter 2 - Hard Gift Box x 1\n\nDelivery address…".
+- `proxy.js` page-path bypass reverted; route 200; browser + scripts cleaned.
+
+---
+
+## 2026-11-12 (session 11) — Shopify Orders page: order # headers, popup eyebrow, no day name, current-month only
+
+**Agent:** OpenCode (GLM) · **Status:** Built and verified (headless-Chrome probe + screenshots, zero exceptions).
+
+### What was asked (gourmaison/shopify-orders)
+1. "Change the time slot in the header of the div" → clarified with the user: the card's
+   big header becomes **"Website Order #<order_name>"** (the time slot moves to the date
+   line); the popup gets the same label **above the customer name**, then the rest.
+2. Remove the day name after the date ("12/11/2026, Thursday" → "12/11/2026").
+3. Hide last-month orders — only the current month shows. Clarified: **delivery month**
+   decides (an order placed in October but delivering in November still shows); orders
+   with no delivery date fall back to their placed month.
+
+### Data facts (read-only REST probe of shopify_orders, 59 rows)
+- `order_name` always "#7239"-style → `orderLabel(o)` = `Website Order ${order_name || "#"+id}`.
+- `delivery_slot` "03:00PM-05:00PM" → fmtSlot already renders "3PM-5PM" (formatting fine).
+- `delivery_day` held the day name ("Thursday") — now unused for display.
+- Months: delivery 2026-10 ×15 + 1 null-delivery (placed Oct), 2026-11 ×43 → the filter
+  leaves exactly 43.
+
+### Changes — `app/gourmaison/shopify-orders/page.jsx` only
+- `dateLine()` drops `o.delivery_day` (affects card, popup, and the copy-to-clipboard text).
+- New `orderLabel(o)` helper; card header `.og-slot` → `.og-order` (serif accent, 26px → 22px
+  so "Website Order #7239" fits one line); slot now a green `.og-date-slot` span on the date
+  line; foot no longer repeats the order number (Test chip kept).
+- Popup: new `.og-modal-order` eyebrow line above the `<h2>` name; date/slot lines unchanged.
+- Current-month filter: `visible = orders.filter(o => monthOf(delivery_date || placed_at) === thisMonth)`
+  (client-side, after the realtime reload — query itself untouched). Header count, empty
+  note ("No orders for this month yet."), and grid all use `visible`.
+
+### Verification (headless, fresh load, zero exceptions)
+- Grid: 43 cards, headers "Website Order #7239/#7238/#7237"…, date lines "12/11/2026 3PM-5PM"
+  + Today chip (×4 today), 0 day names, 0 non-November dates, 0 order numbers in feet.
+- Popup: eyebrow "Website Order #7239" above "Zeeba Sajnani", lines ["12/11/2026","3PM-5PM"].
+- Supabase read is client-side (anon key) → needed no `/api` bypass; only the page path was
+  temp-opened in `proxy.js` and reverted; route 200; browser + scripts (incl. the REST probe)
+  cleaned.
+
+---
+
 ## 2026-11-12 (session 10) — Planner route map: Pune trips (Baner, Kalyani Nagar) now render
 
 **Agent:** OpenCode (GLM) · **Status:** Built and verified (headless-Chrome probe + screenshots, zero exceptions on fresh loads).
