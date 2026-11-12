@@ -1,22 +1,38 @@
-/* Taatsu Shipment Planner: pure logic, ported 1:1 from shipment_planner_v3.html.
-   No React in here. Every function that used a global in the HTML now takes
-   a `ctx` = { S, OV, OVB, OVT, CK } instead. */
+/* Taatsu Shipment Planner: pure logic, ported 1:1 from shipment_planner_v4.html.
+   No React in here. Functions that used globals in the HTML take a `ctx`:
+   ctx = { S, OV, OVB, OVT, CK, WD, WE, CAPW, DAYS } */
 
 const _ = null;
 
-/* ---------- data (from the HTML) ---------- */
+/* ---------- data ---------- */
 
 export const N = ["Gamdevi","Worli","Juhu","Andheri West","Goregaon","Malad","Borivali West","Marol","Powai","Thane","Baner","Kalyani Nagar","Bandra","Matunga","Kandivali"];
 export const CAP  = [918,918,918,918,918,918,918,918,918,918,918,918,810,1500,1500];
-export const CAPW = CAP.map((c, o) => (o == 10 || o == 11 ? 1150 : c));
+export const CAPW0 = CAP.map((c, o) => (o == 10 || o == 11 ? 1150 : c));
 export const PERF = [9,8,7,9,4,4,2,7,5,2,7,8,9,12,8];
-export const TRIG = N.map((_n, o) => (o == 13 || o == 14 ? 450 : o == 5 || o == 6 ? 250 : o == 9 ? 120 : 300));
-export const DROP = N.map((_n, o) => (o == 13 || o == 14 ? 700 : o == 10 || o == 11 ? 850 : o == 9 ? 300 : 550));
-export const RNG  = N.map((_n, o) => (o == 13 || o == 14 ? "600–800" : o == 10 || o == 11 ? "800–900" : o == 9 ? "~300" : "500–600"));
-export const LL = [[18.96,72.81],[19.017,72.818],[19.1,72.827],[19.136,72.83],[19.165,72.85],[19.187,72.848],[19.229,72.857],[19.116,72.88],[19.118,72.905],[19.218,72.978],[18.559,73.787],[18.548,73.902],[19.06,72.836],[19.027,72.85],[19.205,72.855]];
-export const Z = "CCWWWWWEEEPPWCW";
+
+// real coordinates from the owner (same order as N); KIT = central kitchen, Tardeo
+export const LL = [
+  [18.9592286, 72.8129089], // Gamdevi
+  [18.9945254, 72.8220039], // Worli
+  [19.0890198, 72.8360391], // Juhu
+  [19.1252344, 72.8318347], // Andheri West
+  [19.128224, 72.8261697],  // Goregaon
+  [19.1888664, 72.7782226], // Malad
+  [19.2335, 72.853],        // Borivali West
+  [19.1122481, 72.8803645], // Marol
+  [19.1126571, 72.9112707], // Powai
+  [19.2537495, 72.9821635], // Thane
+  [18.5566043, 73.7410824], // Baner
+  [18.5479783, 73.9180992], // Kalyani Nagar
+  [19.052706, 72.827826],   // Bandra
+  [19.0269716, 72.8561727], // Matunga
+  [19.2099865, 72.8731943], // Kandivali
+];
+export const KIT = [18.9769534, 72.8121371];
+
+export const Z = "CCWWWWWEEEPPWCW"; // C central, W west, E east, P Pune
 export const NEAR = [1,1,0,0,0,0,0,0,0,0,0,0,1,1,0];
-export const KIT = [18.969, 72.813];
 export const DAY = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 
 // [name, sales mix %, stock per outlet (null = not carried)]
@@ -44,37 +60,57 @@ export const PK = ["Box of 1","Box of 3","Small doggy bag","Large doggy bag"];
 export const GN = ["Cocoa powder","Icing sugar","Cinnamon powder"];
 export const XI = PK.concat(GN);
 
+/* ---------- helpers ---------- */
+
+export const sum = (a) => a.reduce((x, y) => x + y, 0);
+export const r6 = (v) => Math.floor(Math.max(0, v) / 6) * 6;
+export const fm = (n) => "₹" + Math.round(n).toLocaleString("en-IN");
+export const cpt = (n) => "₹" + n.toFixed(1);
+// straight-line distance x 1.35 road factor
+export const hv = (a, b) => 111 * Math.hypot(a[0] - b[0], (a[1] - b[1]) * 0.95) * 1.35;
+
 /* ---------- initial editable state ---------- */
 
 // negative values are system errors: treat as 0
 export const initialStock = () => N.map((_n, o) => FL.map((f) => (f[2][o] == null ? null : Math.max(0, f[2][o]))));
 export const initialExtras = () => N.map(() => XI.map(() => 0));
-export const r6 = (v) => Math.floor(Math.max(0, v) / 6) * 6;
 export const initialCK = () => FL.map((f) => (f[1] ? r6((3800 * f[1]) / 99.6) : 0));
 export const initialProd = () => [1500, 1500, 1500, 1500, 1500, 1500];
+// examples scaled from Gamdevi (140 weekday, 210 weekend) by performance %
+export const initialWD = () => PERF.map((p) => Math.round((140 * p) / 9));
+export const initialWE = () => PERF.map((p) => Math.round((210 * p) / 9));
+export const initialCapw = () => CAPW0.slice();
 
-/* ---------- helpers ---------- */
-
-export const sum = (a) => a.reduce((x, y) => x + y, 0);
 export const stk = (S, o) => sum(S[o].map((v) => Math.max(0, v || 0)));
 export const ckTot = (CK) => sum(CK);
-export const SALES = PERF.map((p) => (1500 * p) / 101);
-export const fm = (n) => "₹" + Math.round(n).toLocaleString("en-IN");
-export const cpt = (n) => "₹" + n.toFixed(1);
 
-// straight-line distance estimate x 1.35 road factor
-export const hv = (a, b) => 111 * Math.hypot(a[0] - b[0], (a[1] - b[1]) * 0.95) * 1.35;
+/* ---------- sales and cover ---------- */
+
+export const sales = (ctx, o, d) => (d.getDay() == 0 || d.getDay() == 6 ? ctx.WE[o] : ctx.WD[o]);
+
+// days of stock left, walking forward day by day (weekend rate Sat and Sun)
+export function cover(ctx, o, d, s) {
+  const x = new Date(d);
+  let c = 0;
+  for (let i = 0; i < 14; i++) {
+    const q = sales(ctx, o, x) || 1;
+    if (s >= q) { s -= q; c++; }
+    else { c += s / q; break; }
+    x.setDate(x.getDate() + 1);
+  }
+  return c;
+}
 
 /* ---------- boxes ---------- */
 
-// thermocol boxes for U tarts: a = 60L boxes, b = 30L boxes
+// 60L = 50 trays (300 tarts), 30L = 17 trays (102 tarts)
 export function thA(U) {
   const tr = Math.ceil(U / 6);
-  let a = Math.floor(tr / 48), r = tr % 48, b = 0;
-  if (r > 0) { if (r <= 16) b = 1; else a++; }
+  let a = Math.floor(tr / 50), r = tr % 50, b = 0;
+  if (r > 0) { if (r <= 17) b = 1; else a++; }
   return { m: "t", a, b };
 }
-export const bcap = (b) => (b.m == "c" ? b.c * 192 : b.a * 288 + b.b * 96);
+export const bcap = (b) => (b.m == "c" ? b.c * 192 : b.a * 300 + b.b * 102);
 export const dry = (o, b) =>
   Z[o] == "P" ? b.a * 3.5 + b.b * 2 : NEAR[o] ? b.a * 0.225 + b.b * 0.1 : b.a * 0.55 + b.b * 0.4;
 
@@ -84,22 +120,31 @@ export function box(ctx, o, U, m, ov) {
   return m == "t" ? thA(U) : { m: "c", c: Math.ceil(U / 192) };
 }
 
-/* ---------- flavour split ---------- */
+/* ---------- flavour split (largest remainder, kitchen limit per flavour) ---------- */
 
-export function split(ctx, o, TOT, ov) {
+export function split(ctx, o, TOT, ov, lim) {
   const { S, OV } = ctx;
   const q = FL.map(() => 0);
   const cl = FL.map((f, i) => f[1] && S[o][i] != null);
   const ss = sum(FL.map((f, i) => (!f[1] && S[o][i] != null && ov && OV[o + "|" + i] != null ? OV[o + "|" + i] : 0)));
-  const bud = Math.max(0, TOT - ss);
+  const bt = Math.max(0, Math.round((TOT - ss) / 6));
   const cp = sum(FL.map((f, i) => (cl[i] ? f[1] : 0)));
   const sc = sum(FL.map((f, i) => (cl[i] ? S[o][i] : 0)));
-  const L = sc + bud;
+  const L = sc + bt * 6;
   const w = FL.map((f, i) => (cl[i] ? Math.max(0, (L * f[1]) / cp - S[o][i]) : 0));
   const ws = sum(w);
+  const id = FL.map((f, i) => (cl[i] ? (ws ? w[i] / ws : f[1] / cp) * bt : 0));
+  const base = id.map((v) => Math.floor(v));
+  let rem = bt - sum(base);
+  id.map((v, i) => [v - Math.floor(v), i]).sort((a, b) => b[0] - a[0]).forEach((x) => {
+    if (rem > 0 && cl[x[1]]) { base[x[1]]++; rem--; }
+  });
   FL.forEach((f, i) => {
     if (S[o][i] == null) return;
-    if (cl[i]) q[i] = r6(ws ? (w[i] / ws) * bud : (bud * f[1]) / cp);
+    if (cl[i]) {
+      q[i] = base[i] * 6;
+      if (lim) q[i] = Math.min(q[i], r6(lim[i]));
+    }
     if (ov && OV[o + "|" + i] != null) q[i] = OV[o + "|" + i];
   });
   return q;
@@ -107,7 +152,6 @@ export function split(ctx, o, TOT, ov) {
 
 /* ---------- trips ---------- */
 
-// nearest-neighbour from the kitchen
 export function order(ids) {
   const out = [];
   let cur = KIT, rest = ids.slice();
@@ -120,7 +164,7 @@ export function order(ids) {
   return out;
 }
 
-// west+central and east never share a trip when both are present; Pune is its own trip; max 5 drops
+// west+central and east never share a trip (so Goregaon and Thane are always apart); Pune alone; max 5 drops
 export function mkTrips(ids) {
   const pu = ids.filter((o) => Z[o] == "P");
   const mu = ids.filter((o) => Z[o] != "P");
@@ -137,7 +181,7 @@ export function mkTrips(ids) {
   return out;
 }
 
-// vehicle options for one trip, valid first then cheapest
+// vehicle options for one trip: valid first, then cheapest
 export function opts(ctx, ids, U, ov) {
   const pu = Z[ids[0]] == "P", n = ids.length;
   const vs = pu
@@ -155,30 +199,64 @@ export function opts(ctx, ids, U, ov) {
 
 /* ---------- day plan ---------- */
 
-export function dayPlan(ctx, sel, ov) {
-  const { S, OVB, OVT, CK } = ctx;
+// st = current stock per outlet, d = dispatch date. Fills each outlet to its freezer capacity,
+// lowest days-of-stock first, limited by kitchen stock (also per flavour).
+export function dayPlan(ctx, sel, ov, st, d) {
+  const { OVB, OVT, CK, CAPW } = ctx;
   const T = {};
-  sel.forEach((o) => (T[o] = r6(Math.min(DROP[o], CAPW[o] - stk(S, o)))));
-  const need = sum(sel.map((o) => T[o])), av = ckTot(CK);
-  if (need > av && need > 0) sel.forEach((o) => (T[o] = r6((T[o] * av) / need)));
+  const urg = sel.slice().sort((a, b) => cover(ctx, a, d, st[a]) - cover(ctx, b, d, st[b]));
+  let left = ckTot(CK);
+  urg.forEach((o) => {
+    const g = Math.min(r6(CAPW[o] - st[o]), r6(left));
+    T[o] = g;
+    left -= g;
+  });
   if (ov)
     sel.forEach((o) => {
-      if (OVB[o]) T[o] = Math.min(bcap(OVB[o]), r6(CAPW[o] - stk(S, o)));
+      if (OVB[o]) T[o] = Math.min(bcap(OVB[o]), r6(CAPW[o] - st[o]));
       if (OVT[o] != null) T[o] = OVT[o];
     });
-  const q = {}, u = {};
-  sel.forEach((o) => { q[o] = split(ctx, o, T[o], ov); u[o] = sum(q[o]); });
-  const ids = sel.filter((o) => u[o] > 0);
+  const q = {}, u = {}, lim = CK.slice();
+  urg.forEach((o) => {
+    q[o] = split(ctx, o, T[o], ov, lim);
+    q[o].forEach((v, i) => (lim[i] -= v));
+    u[o] = sum(q[o]);
+  });
+  const ids = urg.filter((o) => u[o] > 0);
   return {
-    q, u,
+    q, u, ids,
     tot: sum(sel.map((o) => u[o])),
     trips: mkTrips(ids).map((t) => ({ ids: t, key: t.join("-"), U: sum(t.map((o) => u[o])), o: opts(ctx, t, u, ov) })),
   };
 }
 
-export function pick(t, us, SELV) {
+export function pick(t, us, force, SELV) {
   const x = us && SELV[t.key] && t.o.find((v) => v.k == SELV[t.key]);
-  return x || t.o.find((z) => z.valid) || t.o[0];
+  if (x) return x;
+  const f = force && t.o.find((v) => v.k == force && v.valid);
+  return f || t.o.find((z) => z.valid) || t.o[0];
+}
+
+/* ---------- which outlets go (decision rule) ---------- */
+
+export function rule(ctx, st, d) {
+  const r = N.map((_n, o) => o).sort((a, b) => cover(ctx, a, d, st[a]) - cover(ctx, b, d, st[b]));
+  const crit = r.filter((o) => cover(ctx, o, d, st[o]) < ctx.DAYS);
+  const mu = crit.every((o) => Z[o] != "P");
+  const pad = r.slice(0, 4);
+  if (!crit.length)
+    return [{ l: "Skip dispatch", ids: [], f: null }, { l: "Send to the 4 lowest", ids: pad, f: null }];
+  if (crit.length >= 4) return [{ l: "All critical outlets", ids: crit, f: null }];
+  const A = { l: "Critical only, private 3-wheeler", ids: crit, f: "pv" };
+  const B = { l: "Add lowest stock to reach 4", ids: pad, f: null };
+  return crit.length <= 2 && mu ? [A, B] : [B].concat(mu ? [A] : []);
+}
+
+export function optCost(ctx, op, st, d) {
+  const P = dayPlan(ctx, op.ids, false, st, d);
+  let c = 0, u = 0;
+  P.trips.forEach((t) => { c += pick(t, false, op.f, {}).c; u += t.U; });
+  return u ? c / u : null;
 }
 
 /* ---------- week plan ---------- */
@@ -194,28 +272,28 @@ export function wdays(dateStr) {
   return out;
 }
 
-export function weekRows(ctx, P, PROD, SELV, dateStr) {
-  const { S, CK } = ctx;
+export function weekRows(ctx, P, PROD, SELV, FORCE, dateStr) {
+  const { S, CK, CAPW } = ctx;
   const st = N.map((_n, o) => stk(S, o));
   const rows = [];
+  const ds = wdays(dateStr);
   let ck = ckTot(CK);
-  wdays(dateStr).forEach((d, i) => {
-    let U = {}, trips;
-    if (i == 0) { U = P.u; trips = P.trips; }
+  ds.forEach((d, i) => {
+    let U = {}, trips, force = null;
+    if (i == 0) { U = P.u; trips = P.trips; force = FORCE; }
     else {
+      const op = rule(ctx, st, d)[0];
+      force = op.f;
       let left = ck;
-      N.map((_n, o) => o)
-        .filter((o) => st[o] <= TRIG[o])
-        .sort((a, b) => st[a] / TRIG[a] - st[b] / TRIG[b])
-        .forEach((o) => {
-          const g = Math.min(r6(DROP[o]), r6(CAPW[o] - st[o]), r6(left));
-          if (g > 0) { U[o] = g; left -= g; }
-        });
+      op.ids.slice().sort((a, b) => cover(ctx, a, d, st[a]) - cover(ctx, b, d, st[b])).forEach((o) => {
+        const g = Math.min(r6(CAPW[o] - st[o]), r6(left));
+        if (g > 0) { U[o] = g; left -= g; }
+      });
       trips = mkTrips(Object.keys(U).map(Number)).map((t) => ({ ids: t, key: t.join("-"), U: sum(t.map((o) => U[o])), o: opts(ctx, t, U, false) }));
     }
     const ids = Object.keys(U).map(Number).filter((o) => U[o] > 0);
     const ship = sum(ids.map((o) => U[o]));
-    const ch = trips.map((t) => pick(t, i == 0, SELV));
+    const ch = trips.map((t) => pick(t, i == 0, force, SELV));
     const c = sum(ch.map((x) => x.c));
     const close = ck - ship + PROD[i];
     rows.push({
@@ -224,7 +302,10 @@ export function weekRows(ctx, P, PROD, SELV, dateStr) {
       cpt: ship ? c / ship : null,
     });
     ids.forEach((o) => (st[o] += U[o]));
-    N.forEach((_n, o) => (st[o] = Math.max(0, st[o] - SALES[o])));
+    // outlets keep selling every calendar day, Sundays included
+    const nx = ds[i + 1] || new Date(d.getTime() + 864e5);
+    for (let x = new Date(d); x < nx; x.setDate(x.getDate() + 1))
+      N.forEach((_n, o) => (st[o] = Math.max(0, st[o] - sales(ctx, o, x))));
     ck = close;
   });
   return rows;

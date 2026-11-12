@@ -10,6 +10,11 @@ export const COL = ["#e4572e", "#2e86de", "#27ae60", "#8e44ad"];
 
 const BOUNDS = [[18.88, 72.74], [19.32, 73.05]];
 
+// Esri light-grey tiles (same as your working map). To use Carto instead:
+// url "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", attribution "© OpenStreetMap contributors © CARTO"
+const TILE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}";
+const TILE_ATTR = "Tiles &copy; Esri";
+
 const pin = (n, color) =>
   L.divIcon({
     className: "",
@@ -80,7 +85,7 @@ export default function RouteMap({ trips }) {
 
   return (
     <div>
-      <div className="h-72 overflow-hidden rounded-lg border border-slate-200 sm:h-96 dark:border-slate-700">
+      <div className="h-72 overflow-hidden rounded-xl sm:h-96">
         <MapContainer
           center={KIT}
           zoom={12}
@@ -90,10 +95,7 @@ export default function RouteMap({ trips }) {
           scrollWheelZoom={false}
           style={{ height: "100%", width: "100%" }}
         >
-          <TileLayer
-            url="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}"
-            attribution="© OpenStreetMap contributors © CARTO"
-          />
+          <TileLayer url={TILE_URL} attribution={TILE_ATTR} maxZoom={16} />
           <Fit pts={fitPts} />
 
           {/* outlets not in a trip: small grey dots (Mumbai only) */}
@@ -156,7 +158,7 @@ export default function RouteMap({ trips }) {
             <b style={{ color: COL[t.i % 4] }}>Trip {t.i + 1}</b> is a Pune run ({t.ids.map((o) => N[o]).join(" → ")}), about 150 km away and off the Mumbai map.
           </div>
         ))}
-        <div className="text-slate-500">Drive times are typical, not live traffic. Pins show visiting order.</div>
+        <div className="text-slate-400">Typical drive times, not live traffic.</div>
       </div>
     </div>
   );
