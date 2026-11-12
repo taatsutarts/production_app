@@ -8,6 +8,8 @@ import {
   stk, ckTot, sum, r6, fm, cpt, hv, bcap, dry,
   cover, rule, optCost, dayPlan, pick, weekRows,
 } from "./planner";
+import { fetchCKClosing } from "./ckStock";
+import { fetchOutletStock } from "./outletStock";
 
 // Leaflet touches `window`, so the map only loads in the browser
 const RouteMap = dynamic(() => import("./RouteMap"), {
@@ -20,13 +22,13 @@ const COL = ["#e4572e", "#2e86de", "#27ae60", "#8e44ad"];
 /* ---------- small ui pieces ---------- */
 
 const card = "rounded-2xl border border-slate-200 bg-white p-3 shadow-sm dark:border-slate-800 dark:bg-slate-900";
-const title = "text-sm font-semibold";
-const mute = "text-xs text-slate-500 dark:text-slate-400";
-const th = "px-2 py-1.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400";
+const title = "text-base font-semibold";
+const mute = "text-sm text-slate-500 dark:text-slate-400";
+const th = "px-2 py-1.5 text-left text-sm font-medium text-slate-500 dark:text-slate-400";
 const td = "px-2 py-1.5";
 const row = "border-t border-slate-100 dark:border-slate-800";
 const inp =
-  "rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-right text-xs tabular-nums outline-none focus:border-slate-400 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:focus:bg-slate-900";
+  "rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-right text-sm tabular-nums outline-none focus:border-slate-400 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:focus:bg-slate-900";
 
 const TONE = {
   red: "bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-300",
@@ -34,7 +36,7 @@ const TONE = {
   green: "bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300",
 };
 const Badge = ({ t, children }) => (
-  <span className={`whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ${TONE[t]}`}>{children}</span>
+  <span className={`whitespace-nowrap rounded-full px-2 py-0.5 text-sm font-medium ${TONE[t]}`}>{children}</span>
 );
 
 function Bar({ value, max, over }) {
@@ -46,10 +48,17 @@ function Bar({ value, max, over }) {
   );
 }
 
-// collapsible card with a rotating chevron
-function Fold({ head, children, open }) {
+// collapsible card with a rotating chevron.
+// Uncontrolled by default (native <details> behavior). Pass `open` + `onToggle` to make
+// it a controlled accordion — React 19's canonical pattern: `onToggle` receives the
+// requested open state from the DOM so the `open` prop stays the single source of truth.
+function Fold({ head, children, open, onToggle }) {
   return (
-    <details open={open} className={`group ${card}`}>
+    <details
+      open={open}
+      onToggle={onToggle ? (e) => onToggle(e.currentTarget.open) : undefined}
+      className={`group ${card}`}
+    >
       <summary className="flex cursor-pointer list-none items-center justify-between gap-2 [&::-webkit-details-marker]:hidden">
         <div className="min-w-0 flex-1">{head}</div>
         <span className="text-lg leading-none text-slate-400 transition group-open:rotate-90">›</span>
@@ -110,6 +119,10 @@ export default function PlannerPage() {
   const [WE, setWE] = useState(initialWE);
   const [capw, setCapw] = useState(initialCapw);
   const [CKS, setCKS] = useState(4000);
+  // source info for the Kitchen "In CK" values (last day's closing stock from the daily stock report)
+  const [ckInfo, setCkInfo] = useState(null);
+  // source info for the outlet stock table (shared stock sheet, same import as the PO page)
+  const [sheetInfo, setSheetInfo] = useState(null);
 
   const [optIdx, setOptIdx] = useState(0); // -1 = outlets picked by hand
   const [manual, setManual] = useState([]);
@@ -117,9 +130,48 @@ export default function PlannerPage() {
   const [OV, setOV] = useState({});
   const [OVB, setOVB] = useState({});
   const [OVT, setOVT] = useState({});
+  // quantities accordion: the one fold that is open (outlet index; -1 = none; null = not initialized yet)
+  const [openOutlet, setOpenOutlet] = useState(null);
 
   // date is set on the client only (avoids a server/client date mismatch)
   useEffect(() => setDate(nextWorkingDay()), []);
+
+  // Kitchen "In CK" starts from the real last-day closing stock (daily stock report "Opening",
+  // TARTS only) for the day before the plan date. Changing the plan date re-fetches.
+  useEffect(() => {
+    if (!date) return;
+    let alive = true;
+    setCkInfo(null);
+    fetchCKClosing(date)
+      .then((r) => {
+        if (!alive) return;
+        setCkInfo(r);
+        if (r.ok) setCK(r.qty);
+      })
+      .catch(() => {
+        if (alive) setCkInfo({ ok: false, date: null, qty: null, missing: [], extra: [] });
+      });
+    return () => {
+      alive = false;
+    };
+  }, [date]);
+
+  // outlet stock comes from the shared stock sheet (same import as the PO page); the sheet
+  // lists every SKU an outlet carries, so a missing outlet+flavour row means "not carried"
+  useEffect(() => {
+    let alive = true;
+    fetchOutletStock().then((r) => {
+      if (!alive) return;
+      setSheetInfo(r);
+      if (r.ok && r.S) {
+        setS(r.S);
+        redo(); // stock changed -> re-pick outlets and drop overrides (same rule as manual edits)
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const d = useMemo(() => (date ? new Date(date + "T00:00") : null), [date]);
   const st = useMemo(() => N.map((_n, o) => stk(S, o)), [S]);
@@ -157,6 +209,10 @@ export default function PlannerPage() {
 
   // stock, sales rates, capacity, days of stock or date: re-pick outlets and drop overrides
   const redo = () => { setOptIdx(0); setOV({}); setOVB({}); setOVT({}); setSELV({}); };
+  // default the quantities accordion to the first (most critical) outlet once outlets are picked
+  useEffect(() => {
+    if (openOutlet == null && SEL.length) setOpenOutlet(SEL[0]);
+  }, [SEL, openOutlet]);
   const pickOption = (i) => redo() || setOptIdx(i);
   const toggleOutlet = (o) => {
     setManual(SEL.includes(o) ? SEL.filter((x) => x != o) : SEL.concat(o));
@@ -174,10 +230,10 @@ export default function PlannerPage() {
   const set1d = (setter, i, v) => setter((a) => a.map((x, k) => (k == i ? v : x)));
   const editStock = (o, i, v) => { set2d(setS, o, i, v); redo(); };
 
-  if (!date) return <div className="p-6 text-sm text-slate-500">Loading…</div>;
+  if (!date) return <div className="full-bleed min-h-screen bg-slate-50 p-6 pt-20 text-sm text-slate-500 md:p-10">Loading…</div>;
 
   return (
-    <div className="min-h-screen bg-slate-50 pb-20 text-sm text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+    <div className="full-bleed min-h-screen bg-slate-50 pt-14 pb-20 text-base text-slate-900 md:pt-0">
       <div className="mx-auto max-w-[1500px] px-3 sm:px-5">
         {/* header */}
         <header className="flex flex-wrap items-center justify-between gap-3 py-4">
@@ -225,7 +281,7 @@ export default function PlannerPage() {
                         <button
                           key={o}
                           onClick={() => toggleOutlet(o)}
-                          className={`flex cursor-pointer items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                          className={`flex cursor-pointer items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm font-medium transition ${
                             on
                               ? "border-slate-900 bg-slate-900 text-white dark:border-white dark:bg-white dark:text-slate-900"
                               : "border-slate-200 bg-white hover:border-slate-400 dark:border-slate-700 dark:bg-slate-900"
@@ -261,7 +317,7 @@ export default function PlannerPage() {
                       <select
                         value={c.k}
                         onChange={(e) => setSELV((p) => ({ ...p, [t.key]: e.target.value }))}
-                        className="mt-2 w-full cursor-pointer rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-800"
+                        className="mt-2 w-full cursor-pointer rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-800"
                       >
                         {t.o.map((v) => (
                           <option key={v.k} value={v.k}>
@@ -272,7 +328,7 @@ export default function PlannerPage() {
 
                       <div className="mt-2 flex items-center gap-2">
                         <Bar value={c.used} max={c.cap} over={over > 0} />
-                        <span className="whitespace-nowrap text-xs tabular-nums">
+                        <span className="whitespace-nowrap text-sm tabular-nums">
                           {c.used}/{c.cap} {c.m == "c" ? "cartons" : "slots"}
                         </span>
                         {over > 0 && <Badge t="red">−{over}</Badge>}
@@ -290,7 +346,7 @@ export default function PlannerPage() {
                                   {view.P.u[o]} tarts · holds {bcap(bx)}{c.m == "t" ? ` · ${dry(o, bx).toFixed(1)} kg ice` : ""}
                                 </div>
                               </div>
-                              <div className="flex items-center gap-1 text-xs text-slate-500">
+                              <div className="flex items-center gap-1 text-sm text-slate-500">
                                 {c.m == "c" ? (
                                   <>
                                     <NumInput value={bx.c} label={`${N[o]} cartons`} onCommit={(v) => editBoxes(o, { m: "c", c: v })} w="w-14" />
@@ -332,6 +388,8 @@ export default function PlannerPage() {
                     return (
                       <Fold
                         key={o}
+                        open={openOutlet === o}
+                        onToggle={(requested) => setOpenOutlet((cur) => (requested ? o : cur === o ? -1 : cur))}
                         head={
                           <div>
                             <div className="flex flex-wrap items-center gap-2">
@@ -343,7 +401,7 @@ export default function PlannerPage() {
                             </div>
                             <div className="mt-1.5 flex items-center gap-2">
                               <Bar value={after} max={capw[o]} over={rm < 0} />
-                              <span className="whitespace-nowrap text-xs tabular-nums text-slate-500">{after}/{capw[o]}</span>
+                              <span className="whitespace-nowrap text-sm tabular-nums text-slate-500">{after}/{capw[o]}</span>
                             </div>
                           </div>
                         }
@@ -357,7 +415,7 @@ export default function PlannerPage() {
                         </div>
 
                         <div className="overflow-x-auto">
-                          <table className="w-full text-xs">
+                          <table className="w-full text-sm">
                             <thead><tr><th className={th}>Tarts</th><th className={th}>Stock</th><th className={th}>Send</th></tr></thead>
                             <tbody>
                               {FL.map((f, i) =>
@@ -372,7 +430,7 @@ export default function PlannerPage() {
                             </tbody>
                           </table>
 
-                          <table className="mt-3 w-full text-xs">
+                          <table className="mt-3 w-full text-sm">
                             <thead><tr><th className={th}>Packaging</th><th className={th}>Stock</th><th className={th}>Send</th></tr></thead>
                             <tbody>
                               {PK.map((n, j) => (
@@ -385,7 +443,7 @@ export default function PlannerPage() {
                             </tbody>
                           </table>
 
-                          <table className="mt-3 w-full text-xs">
+                          <table className="mt-3 w-full text-sm">
                             <thead><tr><th className={th}>Garnishing (g)</th><th className={th}>Stock</th><th className={th}>Send</th></tr></thead>
                             <tbody>
                               {GN.map((n, k) => (
@@ -410,17 +468,17 @@ export default function PlannerPage() {
                 <section className="order-1 rounded-2xl bg-slate-900 p-4 text-white shadow-sm dark:bg-slate-800">
                   <div className="flex items-end justify-between gap-3">
                     <div>
-                      <div className="text-xs text-slate-400">Cost per tart</div>
+                      <div className="text-sm text-slate-400">Cost per tart</div>
                       <div className="text-4xl font-semibold tabular-nums tracking-tight">
                         {view.totU ? cpt(view.tot / view.totU) : "–"}
                       </div>
                     </div>
                     <div className="text-right">
                       <div className="text-xl font-semibold tabular-nums">{fm(view.tot)}</div>
-                      <div className="text-xs text-slate-400">{view.totU} tarts</div>
+                      <div className="text-sm text-slate-400">{view.totU} tarts</div>
                     </div>
                   </div>
-                  <div className="mt-3 flex flex-wrap gap-1.5 text-xs">
+                  <div className="mt-3 flex flex-wrap gap-1.5 text-sm">
                     {view.trips.map(({ c }, ti) => (
                       <span key={ti} className="flex items-center gap-1.5 rounded-full bg-white/10 px-2.5 py-1">
                         <span className="h-2 w-2 rounded-full" style={{ background: COL[ti % 4] }} />
@@ -444,7 +502,7 @@ export default function PlannerPage() {
                         <button
                           key={i}
                           onClick={() => pickOption(i)}
-                          className={`flex cursor-pointer items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left text-xs transition ${
+                          className={`flex cursor-pointer items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left text-sm transition ${
                             i == optIdx
                               ? "border-slate-900 bg-slate-900 text-white dark:border-white dark:bg-white dark:text-slate-900"
                               : "border-slate-200 hover:border-slate-400 dark:border-slate-700"
@@ -466,14 +524,27 @@ export default function PlannerPage() {
                     head={
                       <div className="flex flex-wrap items-center gap-2">
                         <span className={title}>Kitchen</span>
+                        <span className={mute}>
+                          {ckInfo == null
+                            ? "opening: loading…"
+                            : ckInfo.ok
+                              ? `opening ${ckInfo.date}`
+                              : "opening: no stock entry — manual values"}
+                        </span>
                         <span className="tabular-nums">{view.ckT} in stock</span>
                         <span className={mute}>sending {view.sT}</span>
                         {view.short > 0 ? <Badge t="red">short {view.short}</Badge> : <Badge t="green">{view.left} left</Badge>}
                       </div>
                     }
                   >
+                    {ckInfo?.ok && (ckInfo.missing.length > 0 || ckInfo.extra.length > 0) && (
+                      <div className={`${mute} mb-2`}>
+                        {ckInfo.missing.length > 0 && <div>no stock entry for: {ckInfo.missing.join(", ")}</div>}
+                        {ckInfo.extra.length > 0 && <div>in stock report but not in planner: {ckInfo.extra.join(", ")}</div>}
+                      </div>
+                    )}
                     <div className="overflow-x-auto">
-                      <table className="w-full text-xs">
+                      <table className="w-full text-sm">
                         <thead><tr><th className={th}>Flavour</th><th className={th}>In CK</th><th className={th}>Sending</th><th className={th}>Left</th></tr></thead>
                         <tbody>
                           {FL.map((f, i) => (
@@ -502,7 +573,7 @@ export default function PlannerPage() {
             <section className={`${card} mt-5`}>
               <h2 className={`${title} mb-2`}>Next 6 working days</h2>
               <div className="overflow-x-auto">
-                <table className="w-full text-xs">
+                <table className="w-full text-sm">
                   <thead>
                     <tr>{["Day", "Open", "Prod", "Outlets", "Sent", "Close", "Service", "₹/tart"].map((h) => <th key={h} className={th}>{h}</th>)}</tr>
                   </thead>
@@ -528,7 +599,7 @@ export default function PlannerPage() {
             <section className="mt-3 flex flex-col gap-3">
               <Fold head={<span className={title}>Sales and freezer capacity</span>}>
                 <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
+                  <table className="w-full text-sm">
                     <thead><tr><th className={th}>Outlet</th><th className={th}>Weekday</th><th className={th}>Weekend</th><th className={th}>Freezer</th></tr></thead>
                     <tbody>
                       {N.map((n, o) => (
@@ -548,24 +619,53 @@ export default function PlannerPage() {
                 </label>
               </Fold>
 
-              <Fold head={<span className={title}>Stock of every outlet</span>}>
+              <Fold
+                head={
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={title}>Stock of every outlet</span>
+                    <span className={mute}>
+                      {sheetInfo == null
+                        ? "sheet: loading…"
+                        : sheetInfo.ok
+                          ? `sheet ${sheetInfo.date || "(no date)"}`
+                          : "sheet failed — manual values"}
+                    </span>
+                    {sheetInfo?.ok && sheetInfo.missing.length > 0 && (
+                      <Badge t="amber">no sheet data: {sheetInfo.missing.length}</Badge>
+                    )}
+                    {sheetInfo?.ok && sheetInfo.manual.length > 0 && (
+                      <Badge t="amber">manual stock: {sheetInfo.manual.length}</Badge>
+                    )}
+                  </div>
+                }
+              >
+                {sheetInfo?.ok && (sheetInfo.missing.length > 0 || sheetInfo.manual.length > 0 || sheetInfo.unknownOutlets.length > 0 || sheetInfo.unknownItems.length > 0) && (
+                  <div className={`${mute} mb-2`}>
+                    {sheetInfo.missing.length > 0 && <div>no stock rows in sheet: {sheetInfo.missing.join(", ")}</div>}
+                    {sheetInfo.manual.length > 0 && <div>hardcoded stock (not reporting in sheet yet): {sheetInfo.manual.join(", ")}</div>}
+                    {sheetInfo.unknownOutlets.length > 0 && <div>in sheet but not in planner: {sheetInfo.unknownOutlets.join(", ")}</div>}
+                    {sheetInfo.unknownItems.length > 0 && <div>stock items not matched to a planner flavour: {sheetInfo.unknownItems.join(", ")}</div>}
+                  </div>
+                )}
                 <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
+                  <table className="w-full text-sm">
                     <thead>
                       <tr>
-                        <th className={th}>Outlet</th>
-                        {FL.map((f) => <th key={f[0]} className={`${th} whitespace-nowrap`}>{f[0]}</th>)}
+                        <th className={th}>Product</th>
+                        {N.map((n) => <th key={n} className={`${th} whitespace-nowrap`}>{n}</th>)}
+                        <th className={th}>Total</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {N.map((n, o) => (
-                        <tr key={n} className={row}>
-                          <td className={`${td} whitespace-nowrap font-medium`}>{n}</td>
-                          {FL.map((f, i) => (
-                            <td key={f[0]} className={td}>
-                              {S[o][i] == null ? "–" : <NumInput value={S[o][i]} label={`${n} ${f[0]} stock`} onCommit={(v) => editStock(o, i, v)} w="w-14" />}
+                      {FL.map((f, i) => (
+                        <tr key={f[0]} className={row}>
+                          <td className={`${td} whitespace-nowrap font-medium`}>{f[0]}</td>
+                          {N.map((n, o) => (
+                            <td key={n} className={td}>
+                              <NumInput value={S[o][i] ?? 0} label={`${f[0]} ${n} stock`} onCommit={(v) => editStock(o, i, v)} w="w-14" />
                             </td>
                           ))}
+                          <td className={`${td} tabular-nums`}>{sum(N.map((_n, o) => S[o][i] || 0))}</td>
                         </tr>
                       ))}
                     </tbody>

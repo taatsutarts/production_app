@@ -8,7 +8,8 @@ import { N, LL, Z, KIT } from "./planner";
 
 export const COL = ["#e4572e", "#2e86de", "#27ae60", "#8e44ad"];
 
-const BOUNDS = [[18.88, 72.74], [19.32, 73.05]];
+const BOUNDS = [[18.88, 72.74], [19.32, 73.05]]; // Mumbai outlets
+const PUNE_BOUNDS = [[18.4, 72.65], [19.4, 74.1]]; // widens when a Pune run is in the plan
 
 // Esri light-grey tiles (same as your working map). To use Carto instead:
 // url "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", attribution "© OpenStreetMap contributors © CARTO"
@@ -57,17 +58,27 @@ function Fit({ pts }) {
   return null;
 }
 
+// panning limits: tight around Mumbai normally, wide enough for Pune runs when needed
+function Bounds({ pune }) {
+  const map = useMap();
+  useEffect(() => {
+    map.setMaxBounds(pune ? PUNE_BOUNDS : BOUNDS);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pune]);
+  return null;
+}
+
 /* trips: [{ ids: [outletIndex, ...] }] in visiting order; trip colour = COL[index % 4] */
 export default function RouteMap({ trips }) {
-  const mumbai = useMemo(() => trips.map((t, i) => ({ ...t, i })).filter((t) => Z[t.ids[0]] != "P"), [trips]);
-  const pune = useMemo(() => trips.map((t, i) => ({ ...t, i })).filter((t) => Z[t.ids[0]] == "P"), [trips]);
+  const all = useMemo(() => trips.map((t, i) => ({ ...t, i })), [trips]);
+  const pune = all.filter((t) => Z[t.ids[0]] == "P");
   const [routes, setRoutes] = useState({});
 
-  const sig = mumbai.map((t) => t.ids.join("-")).join("|");
+  const sig = all.map((t) => t.ids.join("-")).join("|");
 
   useEffect(() => {
     let dead = false;
-    mumbai.forEach((t) => {
+    all.forEach((t) => {
       const key = t.ids.join("-");
       if (!cache.has(key)) {
         cache.set(key, fetchRoute(t.ids).then((res) => { if (res.fail) cache.delete(key); return res; }));
@@ -80,8 +91,8 @@ export default function RouteMap({ trips }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sig]);
 
-  const used = new Set(mumbai.flatMap((t) => t.ids));
-  const fitPts = [KIT].concat(mumbai.flatMap((t) => t.ids.map((o) => LL[o])));
+  const used = new Set(all.flatMap((t) => t.ids));
+  const fitPts = [KIT].concat(all.flatMap((t) => t.ids.map((o) => LL[o])));
 
   return (
     <div>
@@ -89,33 +100,36 @@ export default function RouteMap({ trips }) {
         <MapContainer
           center={KIT}
           zoom={12}
-          minZoom={10}
+          minZoom={7}
           maxBounds={BOUNDS}
           maxBoundsViscosity={1}
           scrollWheelZoom={false}
           style={{ height: "100%", width: "100%" }}
         >
           <TileLayer url={TILE_URL} attribution={TILE_ATTR} maxZoom={16} />
+          <Bounds pune={pune.length > 0} />
           <Fit pts={fitPts} />
 
-          {/* outlets not in a trip: small grey dots (Mumbai only) */}
+          {/* outlets not in a trip: small grey dots */}
           {LL.map((l, o) =>
-            Z[o] != "P" && !used.has(o) ? (
+            !used.has(o) ? (
               <CircleMarker key={o} center={l} radius={4} pathOptions={{ color: "#64748b", fillColor: "#94a3b8", fillOpacity: 0.8, weight: 1 }}>
                 <Tooltip>{N[o]}</Tooltip>
               </CircleMarker>
             ) : null
           )}
 
-          {/* one road route per trip, straight dashed line until/unless OSRM answers */}
-          {mumbai.map((t) => {
+          {/* one road route per trip, straight dashed line until/unless OSRM answers.
+              Different keys force a remount when the road route arrives — Leaflet's
+              setStyle never removes the fallback's dashArray otherwise. */}
+          {all.map((t) => {
             const r = routes[t.ids.join("-")];
             const c = COL[t.i % 4];
             return r && !r.fail ? (
-              <Polyline key={t.ids.join("-")} positions={r.pts} pathOptions={{ color: c, weight: 4, opacity: 0.85 }} />
+              <Polyline key={t.ids.join("-") + "-road"} positions={r.pts} pathOptions={{ color: c, weight: 4, opacity: 0.85 }} />
             ) : (
               <Polyline
-                key={t.ids.join("-")}
+                key={t.ids.join("-") + "-approx"}
                 positions={[KIT].concat(t.ids.map((o) => LL[o]))}
                 pathOptions={{ color: c, weight: 3, opacity: 0.7, dashArray: "6 6" }}
               />
@@ -123,7 +137,7 @@ export default function RouteMap({ trips }) {
           })}
 
           {/* numbered pins in visiting order */}
-          {mumbai.flatMap((t) =>
+          {all.flatMap((t) =>
             t.ids.map((o, i) => (
               <Marker key={t.i + "-" + o} position={LL[o]} icon={pin(i + 1, COL[t.i % 4])}>
                 <Tooltip direction="right" offset={[10, 0]} permanent>{N[o]}</Tooltip>
@@ -137,12 +151,13 @@ export default function RouteMap({ trips }) {
         </MapContainer>
       </div>
 
-      <div className="mt-2 space-y-1 text-xs">
-        {mumbai.map((t) => {
+      <div className="mt-2 space-y-1 text-sm">
+        {all.map((t) => {
           const r = routes[t.ids.join("-")];
           return (
             <div key={t.i}>
-              <b style={{ color: COL[t.i % 4] }}>Trip {t.i + 1}</b>{" "}
+              <b style={{ color: COL[t.i % 4] }}>Trip {t.i + 1}</b>
+              {Z[t.ids[0]] == "P" && <span className="text-slate-400"> (Pune)</span>}{" "}
               {r && !r.fail ? (
                 <span>{r.km.toFixed(1)} km · about {Math.round(r.min)} min driving</span>
               ) : r && r.fail ? (
@@ -153,11 +168,6 @@ export default function RouteMap({ trips }) {
             </div>
           );
         })}
-        {pune.map((t) => (
-          <div key={t.i} className="text-slate-500">
-            <b style={{ color: COL[t.i % 4] }}>Trip {t.i + 1}</b> is a Pune run ({t.ids.map((o) => N[o]).join(" → ")}), about 150 km away and off the Mumbai map.
-          </div>
-        ))}
         <div className="text-slate-400">Typical drive times, not live traffic.</div>
       </div>
     </div>

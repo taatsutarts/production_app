@@ -1,1 +1,12 @@
 @import "tailwindcss";
+
+/* Light mode only: scope every `dark:` variant to an ancestor `.dark` class.
+   Nothing adds that class today, so the app stays light no matter the OS setting.
+   To re-enable dark mode later, put `class="dark"` on <html>. */
+@custom-variant dark (&:is(.dark *));
+
+/* Opt-in edge-to-edge pages: a page root marked .full-bleed cancels the root layout's
+   main padding (the page then provides its own spacing, e.g. pt-14 for the mobile top bar). */
+main:has(> .full-bleed) {
+  padding: 0;
+}

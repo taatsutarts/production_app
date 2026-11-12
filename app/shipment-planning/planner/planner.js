@@ -17,8 +17,8 @@ export const LL = [
   [18.9945254, 72.8220039], // Worli
   [19.0890198, 72.8360391], // Juhu
   [19.1252344, 72.8318347], // Andheri West
-  [19.128224, 72.8261697],  // Goregaon
-  [19.1888664, 72.7782226], // Malad
+  [19.1716362, 72.8552091],  // Goregaon
+  [19.1888757, 72.8362408], // Malad
   [19.2335, 72.853],        // Borivali West
   [19.1122481, 72.8803645], // Marol
   [19.1126571, 72.9112707], // Powai
@@ -71,8 +71,9 @@ export const hv = (a, b) => 111 * Math.hypot(a[0] - b[0], (a[1] - b[1]) * 0.95) 
 
 /* ---------- initial editable state ---------- */
 
+// the planner shows a number for every outlet+flavour: no value = 0 (never "not carried").
 // negative values are system errors: treat as 0
-export const initialStock = () => N.map((_n, o) => FL.map((f) => (f[2][o] == null ? null : Math.max(0, f[2][o]))));
+export const initialStock = () => N.map((_n, o) => FL.map((f) => Math.max(0, f[2][o] || 0)));
 export const initialExtras = () => N.map(() => XI.map(() => 0));
 export const initialCK = () => FL.map((f) => (f[1] ? r6((3800 * f[1]) / 99.6) : 0));
 export const initialProd = () => [1500, 1500, 1500, 1500, 1500, 1500];
