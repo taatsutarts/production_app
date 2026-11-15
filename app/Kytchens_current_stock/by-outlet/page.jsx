@@ -1,4 +1,4 @@
-import { getStockData } from "../../lib/stock";
+import { getStockData } from "@/lib/stock";
 import ByOutletView from "./ByOutletView";
 
 export const dynamic = "force-dynamic";

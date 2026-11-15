@@ -4,7 +4,7 @@ import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { useEffect, useMemo, useState } from "react";
 import { MapContainer, TileLayer, Marker, Polyline, CircleMarker, Tooltip, useMap } from "react-leaflet";
-import { N, LL, Z, KIT } from "./planner";
+import { N, Z } from "./planner";
 
 export const COL = ["#e4572e", "#2e86de", "#27ae60", "#8e44ad"];
 
@@ -35,8 +35,8 @@ const kitchenIcon = L.divIcon({
    Cached per trip so re-renders and dev StrictMode never refetch. */
 const cache = new Map();
 
-function fetchRoute(ids) {
-  const coords = [[KIT[1], KIT[0]]].concat(ids.map((o) => [LL[o][1], LL[o][0]])).map((c) => c.join(",")).join(";");
+function fetchRoute(ids, ll, kit) {
+  const coords = [[kit[1], kit[0]]].concat(ids.map((o) => [ll[o][1], ll[o][0]])).map((c) => c.join(",")).join(";");
   return fetch(`https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`)
     .then((r) => r.json())
     .then((j) => {
@@ -47,12 +47,12 @@ function fetchRoute(ids) {
     .catch(() => ({ fail: true }));
 }
 
-function Fit({ pts }) {
+function Fit({ pts, kit }) {
   const map = useMap();
   const sig = JSON.stringify(pts);
   useEffect(() => {
     if (pts.length > 1) map.fitBounds(pts, { padding: [28, 28], maxZoom: 14 });
-    else map.setView(KIT, 12);
+    else map.setView(kit, 12);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sig]);
   return null;
@@ -68,20 +68,25 @@ function Bounds({ pune }) {
   return null;
 }
 
-/* trips: [{ ids: [outletIndex, ...] }] in visiting order; trip colour = COL[index % 4] */
-export default function RouteMap({ trips }) {
+/* trips: [{ ids: [outletIndex, ...] }] in visiting order; trip colour = COL[index % 4]
+   ll/kit: coordinates per outlet index + kitchen, from the outlets table (required —
+   the page only renders the map once the table config is complete). The route cache
+   key includes the coordinates, so updating them in the database refetches the routes. */
+export default function RouteMap({ trips, ll, kit }) {
   const all = useMemo(() => trips.map((t, i) => ({ ...t, i })), [trips]);
   const pune = all.filter((t) => Z[t.ids[0]] == "P");
   const [routes, setRoutes] = useState({});
 
-  const sig = all.map((t) => t.ids.join("-")).join("|");
+  // cache/refetch signature: the stops AND their coordinates
+  const tkey = (t) => [kit].concat(t.ids.map((o) => ll[o])).map((c) => c[0].toFixed(5) + "," + c[1].toFixed(5)).join(";");
+  const sig = all.map((t) => tkey(t)).join("|");
 
   useEffect(() => {
     let dead = false;
     all.forEach((t) => {
-      const key = t.ids.join("-");
+      const key = tkey(t);
       if (!cache.has(key)) {
-        cache.set(key, fetchRoute(t.ids).then((res) => { if (res.fail) cache.delete(key); return res; }));
+        cache.set(key, fetchRoute(t.ids, ll, kit).then((res) => { if (res.fail) cache.delete(key); return res; }));
       }
       cache.get(key).then((res) => {
         if (!dead) setRoutes((p) => (p[key] === res ? p : { ...p, [key]: res }));
@@ -92,13 +97,13 @@ export default function RouteMap({ trips }) {
   }, [sig]);
 
   const used = new Set(all.flatMap((t) => t.ids));
-  const fitPts = [KIT].concat(all.flatMap((t) => t.ids.map((o) => LL[o])));
+  const fitPts = [kit].concat(all.flatMap((t) => t.ids.map((o) => ll[o])));
 
   return (
     <div>
       <div className="h-72 overflow-hidden rounded-xl sm:h-96">
         <MapContainer
-          center={KIT}
+          center={kit}
           zoom={12}
           minZoom={7}
           maxBounds={BOUNDS}
@@ -108,10 +113,10 @@ export default function RouteMap({ trips }) {
         >
           <TileLayer url={TILE_URL} attribution={TILE_ATTR} maxZoom={16} />
           <Bounds pune={pune.length > 0} />
-          <Fit pts={fitPts} />
+          <Fit pts={fitPts} kit={kit} />
 
           {/* outlets not in a trip: small grey dots */}
-          {LL.map((l, o) =>
+          {ll.map((l, o) =>
             !used.has(o) ? (
               <CircleMarker key={o} center={l} radius={4} pathOptions={{ color: "#64748b", fillColor: "#94a3b8", fillOpacity: 0.8, weight: 1 }}>
                 <Tooltip>{N[o]}</Tooltip>
@@ -123,14 +128,14 @@ export default function RouteMap({ trips }) {
               Different keys force a remount when the road route arrives — Leaflet's
               setStyle never removes the fallback's dashArray otherwise. */}
           {all.map((t) => {
-            const r = routes[t.ids.join("-")];
+            const r = routes[tkey(t)];
             const c = COL[t.i % 4];
             return r && !r.fail ? (
               <Polyline key={t.ids.join("-") + "-road"} positions={r.pts} pathOptions={{ color: c, weight: 4, opacity: 0.85 }} />
             ) : (
               <Polyline
                 key={t.ids.join("-") + "-approx"}
-                positions={[KIT].concat(t.ids.map((o) => LL[o]))}
+                positions={[kit].concat(t.ids.map((o) => ll[o]))}
                 pathOptions={{ color: c, weight: 3, opacity: 0.7, dashArray: "6 6" }}
               />
             );
@@ -139,13 +144,13 @@ export default function RouteMap({ trips }) {
           {/* numbered pins in visiting order */}
           {all.flatMap((t) =>
             t.ids.map((o, i) => (
-              <Marker key={t.i + "-" + o} position={LL[o]} icon={pin(i + 1, COL[t.i % 4])}>
+              <Marker key={t.i + "-" + o} position={ll[o]} icon={pin(i + 1, COL[t.i % 4])}>
                 <Tooltip direction="right" offset={[10, 0]} permanent>{N[o]}</Tooltip>
               </Marker>
             ))
           )}
 
-          <Marker position={KIT} icon={kitchenIcon}>
+          <Marker position={kit} icon={kitchenIcon}>
             <Tooltip direction="left" offset={[-12, 0]}>Kitchen (Tardeo)</Tooltip>
           </Marker>
         </MapContainer>
@@ -153,7 +158,7 @@ export default function RouteMap({ trips }) {
 
       <div className="mt-2 space-y-1 text-sm">
         {all.map((t) => {
-          const r = routes[t.ids.join("-")];
+          const r = routes[tkey(t)];
           return (
             <div key={t.i}>
               <b style={{ color: COL[t.i % 4] }}>Trip {t.i + 1}</b>

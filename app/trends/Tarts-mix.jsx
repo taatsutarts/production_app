@@ -1,4 +1,4 @@
-import { supabase } from "../lib/supabase";
+import { supabaseService as supabase } from "@/lib/supabaseService";
 
 export const dynamic = "force-dynamic";
 

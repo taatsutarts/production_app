@@ -2,6 +2,10 @@ import { GoogleGenAI } from "@google/genai";
 import sharp from "sharp";
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
+import dns from "dns";
+
+// IPv6-first DNS hangs on this machine (broken IPv6 routing) — force IPv4-first.
+dns.setDefaultResultOrder("ipv4first");
 
 export const maxDuration = 60;
 

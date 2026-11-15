@@ -1,5 +1,5 @@
-import { supabase } from "../../lib/supabase";
-import { getShipmentData } from "../../lib/shipment";
+import { supabaseService as supabase } from "@/lib/supabaseService";
+import { getShipmentData } from "@/lib/shipment";
 import PlanView from "./PlanView";
 
 export const dynamic = "force-dynamic";

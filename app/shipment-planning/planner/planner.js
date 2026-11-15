@@ -1,37 +1,20 @@
 /* Taatsu Shipment Planner: pure logic, ported 1:1 from shipment_planner_v4.html.
    No React in here. Functions that used globals in the HTML take a `ctx`:
-   ctx = { S, OV, OVB, OVT, CK, WD, WE, CAPW, DAYS } */
+   ctx = { S, OV, OVB, OVT, CK, WD, WE, CAPW, DAYS, LL, KIT } (LL/KIT required:
+   outlet coordinates + kitchen, mapped from the `outlets` table by mapConfig) */
 
 const _ = null;
 
 /* ---------- data ---------- */
 
 export const N = ["Gamdevi","Worli","Juhu","Andheri West","Goregaon","Malad","Borivali West","Marol","Powai","Thane","Baner","Kalyani Nagar","Bandra","Matunga","Kandivali"];
-export const CAP  = [918,918,918,918,918,918,918,918,918,918,918,918,810,1500,1500];
-export const CAPW0 = CAP.map((c, o) => (o == 10 || o == 11 ? 1150 : c));
 export const PERF = [9,8,7,9,4,4,2,7,5,2,7,8,9,12,8];
 
-// real coordinates from the owner (same order as N); KIT = central kitchen, Tardeo
-export const LL = [
-  [18.9592286, 72.8129089], // Gamdevi
-  [18.9945254, 72.8220039], // Worli
-  [19.0890198, 72.8360391], // Juhu
-  [19.1252344, 72.8318347], // Andheri West
-  [19.1716362, 72.8552091],  // Goregaon
-  [19.1888757, 72.8362408], // Malad
-  [19.2335, 72.853],        // Borivali West
-  [19.1122481, 72.8803645], // Marol
-  [19.1126571, 72.9112707], // Powai
-  [19.2537495, 72.9821635], // Thane
-  [18.5566043, 73.7410824], // Baner
-  [18.5479783, 73.9180992], // Kalyani Nagar
-  [19.052706, 72.827826],   // Bandra
-  [19.0269716, 72.8561727], // Matunga
-  [19.2099865, 72.8731943], // Kandivali
-];
-export const KIT = [18.9769534, 72.8121371];
-
-export const Z = "CCWWWWWEEEPPWCW"; // C central, W west, E east, P Pune
+// Freezer capacity and coordinates (outlets + the central kitchen) come ONLY from the
+// `outlets` table (outletConfig.js -> mapConfig below; columns from outlets_add_coords.sql
+// at the project root). No copies of those numbers live in code: the table is the single
+// source, and a missing value blocks the plan with a clear message instead of guessing.
+export const Z = "CCWWWWWEEEPPWCW"; // C central, W west, E east, P Pune — same letters as the table's zone column (not wired into the code yet)
 export const NEAR = [1,1,0,0,0,0,0,0,0,0,0,0,1,1,0];
 export const DAY = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 
@@ -69,6 +52,64 @@ export const cpt = (n) => "₹" + n.toFixed(1);
 // straight-line distance x 1.35 road factor
 export const hv = (a, b) => 111 * Math.hypot(a[0] - b[0], (a[1] - b[1]) * 0.95) * 1.35;
 
+/* ---------- outlets-table config (coordinates + freezer capacity) ---------- */
+
+// lowercase, punctuation -> space (for matching planner outlet names to the DB)
+const normName = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+
+// Build the planner's coordinate/capacity config from rows of the Supabase `outlets`
+// table (outletConfig.js fetches them). The table is the single source — there are no
+// built-in fallback values, so every entry the table doesn't provide comes back null
+// and the page blocks the plan with a clear message (see page.jsx).
+//
+// rows: `select * ... where is_active = true` rows. Returns:
+//   ll             [lat,lng] per outlet index in N, or null where the table has none
+//   capw           freezer capacity per outlet (fridge_capacity), or null where missing
+//   kit            kitchen (Tardeo) [lat,lng] from the row named "CK", or null
+//   tableRows      how many rows came back (0 = empty table / nothing active)
+//   dbOutlets      how many planner outlets matched a DB row
+//   missingRows    planner outlets with no active row in the table
+//   missingCoords  matched rows without latitude/longitude
+//   missingCap     matched rows without fridge_capacity
+//   colsMissing    true when the table has no latitude column yet (pre-migration)
+export function mapConfig(rows) {
+  const res = {
+    ll: N.map(() => null), capw: N.map(() => null), kit: null,
+    tableRows: Array.isArray(rows) ? rows.length : 0,
+    dbOutlets: 0, missingRows: [], missingCoords: [], missingCap: [],
+    colsMissing: false,
+  };
+  if (!Array.isArray(rows) || rows.length == 0) return res;
+  // pre-migration the select has no latitude/longitude keys at all
+  if (!rows.some((r) => r && "latitude" in r)) res.colsMissing = true;
+
+  const byName = new Map(), byLoc = new Map();
+  rows.forEach((r) => {
+    if (!r) return;
+    const n = normName(r.name);
+    if (n && !byName.has(n)) byName.set(n, r);
+    const l = normName(r.location);
+    if (l && !byLoc.has(l)) byLoc.set(l, r);
+  });
+
+  // kitchen = the table's own row for the central kitchen ("CK", outlet_type "office")
+  const kitRow = rows.find((r) => r && normName(r.name) == "ck") || rows.find((r) => r && normName(r.outlet_type) == "office");
+  if (kitRow && kitRow.latitude != null && kitRow.longitude != null) res.kit = [kitRow.latitude, kitRow.longitude];
+
+  N.forEach((name, o) => {
+    // name match first ("DN Nagar"), then location ("Andheri West" — the planner's name for it)
+    const r = byName.get(normName(name)) || byLoc.get(normName(name));
+    if (!r) { res.missingRows.push(name); return; }
+    res.dbOutlets++;
+    if (r.latitude != null && r.longitude != null && isFinite(r.latitude) && isFinite(r.longitude))
+      res.ll[o] = [r.latitude, r.longitude];
+    else res.missingCoords.push(name);
+    if (r.fridge_capacity != null && isFinite(r.fridge_capacity)) res.capw[o] = r.fridge_capacity;
+    else res.missingCap.push(name);
+  });
+  return res;
+}
+
 /* ---------- initial editable state ---------- */
 
 // the planner shows a number for every outlet+flavour: no value = 0 (never "not carried").
@@ -80,7 +121,6 @@ export const initialProd = () => [1500, 1500, 1500, 1500, 1500, 1500];
 // examples scaled from Gamdevi (140 weekday, 210 weekend) by performance %
 export const initialWD = () => PERF.map((p) => Math.round((140 * p) / 9));
 export const initialWE = () => PERF.map((p) => Math.round((210 * p) / 9));
-export const initialCapw = () => CAPW0.slice();
 
 export const stk = (S, o) => sum(S[o].map((v) => Math.max(0, v || 0)));
 export const ckTot = (CK) => sum(CK);
@@ -153,20 +193,21 @@ export function split(ctx, o, TOT, ov, lim) {
 
 /* ---------- trips ---------- */
 
-export function order(ids) {
+// ll/kit are required: outlet coordinates + kitchen from the outlets table (ctx.LL/ctx.KIT)
+export function order(ids, ll, kit) {
   const out = [];
-  let cur = KIT, rest = ids.slice();
+  let cur = kit, rest = ids.slice();
   while (rest.length) {
-    rest.sort((a, b) => hv(cur, LL[a]) - hv(cur, LL[b]));
+    rest.sort((a, b) => hv(cur, ll[a]) - hv(cur, ll[b]));
     const n = rest.shift();
     out.push(n);
-    cur = LL[n];
+    cur = ll[n];
   }
   return out;
 }
 
 // west+central and east never share a trip (so Goregaon and Thane are always apart); Pune alone; max 5 drops
-export function mkTrips(ids) {
+export function mkTrips(ids, ll, kit) {
   const pu = ids.filter((o) => Z[o] == "P");
   const mu = ids.filter((o) => Z[o] != "P");
   const W = mu.filter((o) => Z[o] == "W");
@@ -176,7 +217,7 @@ export function mkTrips(ids) {
   if (pu.length) g.push(pu);
   const out = [];
   g.forEach((x) => {
-    const od = order(x);
+    const od = order(x, ll, kit);
     for (let i = 0; i < od.length; i += 5) out.push(od.slice(i, i + 5));
   });
   return out;
@@ -227,7 +268,7 @@ export function dayPlan(ctx, sel, ov, st, d) {
   return {
     q, u, ids,
     tot: sum(sel.map((o) => u[o])),
-    trips: mkTrips(ids).map((t) => ({ ids: t, key: t.join("-"), U: sum(t.map((o) => u[o])), o: opts(ctx, t, u, ov) })),
+    trips: mkTrips(ids, ctx.LL, ctx.KIT).map((t) => ({ ids: t, key: t.join("-"), U: sum(t.map((o) => u[o])), o: opts(ctx, t, u, ov) })),
   };
 }
 
@@ -290,7 +331,7 @@ export function weekRows(ctx, P, PROD, SELV, FORCE, dateStr) {
         const g = Math.min(r6(CAPW[o] - st[o]), r6(left));
         if (g > 0) { U[o] = g; left -= g; }
       });
-      trips = mkTrips(Object.keys(U).map(Number)).map((t) => ({ ids: t, key: t.join("-"), U: sum(t.map((o) => U[o])), o: opts(ctx, t, U, false) }));
+      trips = mkTrips(Object.keys(U).map(Number), ctx.LL, ctx.KIT).map((t) => ({ ids: t, key: t.join("-"), U: sum(t.map((o) => U[o])), o: opts(ctx, t, U, false) }));
     }
     const ids = Object.keys(U).map(Number).filter((o) => U[o] > 0);
     const ship = sum(ids.map((o) => U[o]));

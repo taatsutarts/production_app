@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# agent log with business details - never goes to the public repo
+/CHANGELOG.md

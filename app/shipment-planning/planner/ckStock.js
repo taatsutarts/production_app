@@ -6,7 +6,7 @@
 
    Read-only; no writes anywhere in here. */
 
-import { supabase } from "../../lib/supabaseBrowser";
+import { supabase } from "@/lib/supabaseBrowser";
 import { FL } from "./planner";
 
 const CK_OUTLET = 6; // central kitchen — only its spoilage counts as wastage

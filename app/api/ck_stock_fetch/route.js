@@ -1,6 +1,6 @@
 // app/api/ck_stock_fetch/route.js
 import { NextResponse } from "next/server";
-import { supabase } from "../../lib/supabase"; // adjust path to your lib
+import { supabaseService as supabase } from "@/lib/supabaseService"; // service role: bypasses RLS, server-only
 
 // ignore case, extra spaces, trailing spaces
 const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();

@@ -1,4 +1,4 @@
-import { supabase } from "../lib/supabase";
+import { supabaseService as supabase } from "@/lib/supabaseService";
 import TrendView from "./TrendView";
 
 export const dynamic = "force-dynamic";

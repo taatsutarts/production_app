@@ -1,5 +1,5 @@
 "use server";
-import { supabase } from "../lib/supabase";
+import { supabaseService as supabase } from "@/lib/supabaseService";
 import { revalidatePath } from "next/cache";
 
 export async function updatePoc(id, pocName, pocContact) {

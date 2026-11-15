@@ -3,7 +3,7 @@
 // app/orders/page.jsx  (put it wherever you want the page to live)
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { supabase } from "../../lib/supabase"; // <- change to wherever your Supabase client is exported
+import { supabase } from "@/lib/supabase"; // <- change to wherever your Supabase client is exported
 
 /* ---------- formatting helpers ---------- */
 

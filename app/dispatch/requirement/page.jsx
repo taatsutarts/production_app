@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "../../lib/supabaseBrowser";
+import { supabase } from "@/lib/supabaseBrowser";
 
 const STORES = ["Matunga", "Bandra", "Kandivali"];
 const k = (o, s) => `${o}:${s}`;

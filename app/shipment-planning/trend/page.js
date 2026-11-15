@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { getShipmentData } from "../../lib/shipment";
+import { getShipmentData } from "@/lib/shipment";
 
 export const dynamic = "force-dynamic";
 

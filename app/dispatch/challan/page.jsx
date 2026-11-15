@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { supabase } from "../../lib/supabaseBrowser";
-import { generateChallanPdf } from "../../lib/challan";
+import { supabase } from "@/lib/supabaseBrowser";
+import { generateChallanPdf } from "@/lib/challan";
 
 const STORES = ["Matunga", "Bandra", "Kandivali"];
 const k = (o, s) => `${o}:${s}`;
