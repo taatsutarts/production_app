@@ -5,6 +5,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 import { uploadOriginal } from "@/lib/drive";
+import { saveBillOriginal } from "@/lib/storage";
 import { syncBill } from "@/lib/zoho";
 import { norm } from "@/lib/purchaseMatch";
 
@@ -220,7 +221,27 @@ export async function POST(request) {
     //     vendor matches automatically. A mapping failure must never lose the bill.
     const mappingWarning = await upsertMappings(gate.vendorId, items);
 
-    // 3. upload the original to Drive (best effort — Drive failing never loses the bill)
+    // 3. keep the original where the Zoho sync can attach it later (Supabase
+    //    Storage, private bucket "purchase-bills" — lib/storage.js). Best effort:
+    //    a storage failure never loses the bill; the sync records the attachment
+    //    warning instead (and Drive below stays an optional second copy).
+    let storageError = "";
+    if (file) {
+      const st = await saveBillOriginal({ billId: saved.id, file });
+      if (st.ok) {
+        const { error: spErr } = await sb
+          .from("purchase_bills")
+          .update({ storage_path: st.path })
+          .eq("id", saved.id);
+        if (spErr) {
+          storageError = "the invoice original was stored but the bill could not record it: " + spErr.message;
+        }
+      } else {
+        storageError = "the invoice original could not be stored: " + st.error;
+      }
+    }
+
+    // 3b. upload the original to Drive (best effort — Drive failing never loses the bill)
     let driveError = "";
     if (file) {
       const up = await uploadOriginal({
@@ -250,7 +271,7 @@ export async function POST(request) {
     const { data: final } = await sb.from("purchase_bills").select("*").eq("id", saved.id).single();
     return NextResponse.json({
       bill: final,
-      warning: [driveError, mappingWarning].filter(Boolean).join(" | "),
+      warning: [storageError, driveError, mappingWarning].filter(Boolean).join(" | "),
     });
   } catch (err) {
     console.error("purchase-bills save failed:", err);
@@ -356,6 +377,25 @@ export async function PUT(request) {
     }
     const mappingWarning = await upsertMappings(gate.vendorId, items);
 
+    // optional: a (new) original file -> store it for the Zoho sync first (the
+    // stored copy is what the sync attaches; upsert:true replaces an older copy),
+    // then the Drive upload as before
+    let storageError = "";
+    if (file) {
+      const st = await saveBillOriginal({ billId: id, file });
+      if (st.ok) {
+        const { error: spErr } = await sb
+          .from("purchase_bills")
+          .update({ storage_path: st.path })
+          .eq("id", id);
+        if (spErr) {
+          storageError = "the invoice original was stored but the bill could not record it: " + spErr.message;
+        }
+      } else {
+        storageError = "the invoice original could not be stored: " + st.error;
+      }
+    }
+
     // optional: a (new) original file -> upload to Drive and update the drive fields
     let driveError = "";
     if (file) {
@@ -386,7 +426,7 @@ export async function PUT(request) {
     const { data: final } = await sb.from("purchase_bills").select("*").eq("id", id).single();
     return NextResponse.json({
       bill: final,
-      warning: [driveError, mappingWarning].filter(Boolean).join(" | "),
+      warning: [storageError, driveError, mappingWarning].filter(Boolean).join(" | "),
     });
   } catch (err) {
     console.error("purchase-bills update failed:", err);
