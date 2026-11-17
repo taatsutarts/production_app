@@ -1,16 +1,18 @@
-/* Real outlet stock for the planner: the same spreadsheet import the PO page uses.
-   Both pages read /api/stock (app/lib/stock.js reads the "Kytchens Current Stock" Google
-   Sheet and maps sheet spellings to DB names) — no dependency on the po-send page code.
+/* Real outlet stock for the planner, sourced from the `stores_closing_stock` table
+   (the outlet team enters closing stock daily on /shipment-planning/closing-stock).
 
-   This file reshapes the API result into the planner's stock matrix:
-   S[outlet (index in N)][flavour (index in FL)] = qty, or null when the sheet has no row
-   for that outlet+flavour (the sheet lists every SKU an outlet carries).
-   Outlets absent from the sheet entirely get hardcoded MANUAL_STOCK values for now. */
+   For each outlet the NEWEST entry at or before the dispatch date wins, per flavour.
+   Outlets with no closing-stock rows at all fall back to the shared stock sheet
+   (/api/stock — the same import the PO page uses). Everything else is 0: the table
+   shows numbers, never blanks. No hardcoded stock lives in code anymore.
 
+   S[outlet (index in N)][flavour (index in FL)] = qty. */
+
+import { supabase } from "@/lib/supabaseBrowser";
 import { N, FL } from "./planner";
 import { normItem, itemKeysMatch } from "./ckStock";
 
-// planner outlet names that differ from the DB outlet names returned by /api/stock
+// planner outlet names that differ from the DB outlet names
 const OUTLET_ALIASES = {
   "andheri west": "dn nagar", // planner keeps the colloquial name; DB outlet is "DN Nagar"
 };
@@ -24,62 +26,80 @@ const sameOutlet = (plannerName, dbName) => {
   return a === dropKind(norm(dbName));
 };
 
-/* Hardcoded stock for outlets that don't report stock in the sheet yet
-   (owner-provided 2026-11-12; Biscoff not carried at these stores -> null).
-   FL order. TODO: remove once the stores report stock in the sheet themselves. */
-const MANUAL_STOCK = {
-  Bandra:    [40, 13, 77, 27, 11, 16, 18, 33, 51, 22, null, 34, 18, 28, 23, 28, 32],
-  Matunga:   [48, 53, 99, 44, 38, 72, 70, 82, 64,  7, null, 50, 19, 60, 25, 49, 56],
-  Kandivali: [52, 26, 98, 76, 60, 45, 79, 73, 52, 19, null, 30,  4, 62, 20, 44, 67],
-};
-
-export async function fetchOutletStock() {
-  const empty = { ok: false, date: "", S: null, missing: [], manual: [], unknownOutlets: [], unknownItems: [] };
+export async function fetchOutletStock(dispatchDate) {
+  const empty = { ok: false, S: null, closing: N.map(() => null), missing: [], unknownItems: [], sheet: { used: [], date: "", error: null } };
   try {
-    const r = await fetch("/api/stock");
-    const d = await r.json();
-    if (d.error) return { ...empty, error: d.error };
+    // planner outlet -> DB row (id for the closing-stock query, name for the sheet)
+    const { data: outletRows, error: outErr } = await supabase
+      .from("outlets")
+      .select("id,name")
+      .eq("is_active", true);
+    if (outErr) return { ...empty, error: outErr.message };
+
+    const idOf = N.map((n) => outletRows.find((r) => sameOutlet(n, r.name))?.id ?? null);
+
+    // newest entries at or before the dispatch date (bounded window: 14 days)
+    let q = supabase
+      .from("stores_closing_stock")
+      .select("stock_date,outlet_id,item_name,qty")
+      .order("stock_date", { ascending: false })
+      .limit(2000);
+    if (dispatchDate) q = q.lte("stock_date", dispatchDate);
+    const { data: closingRows, error: cErr } = await q;
+    if (cErr) return { ...empty, error: cErr.message };
 
     const S = N.map(() => FL.map(() => null));
-    const unknownOutlets = new Set(), unknownItems = new Set();
+    const closing = N.map(() => null); // the closing-stock date used, per outlet
+    const unknownItems = new Set();
 
-    for (const row of d.stock || []) {
-      const o = N.findIndex((n) => sameOutlet(n, row.outlet));
-      if (o < 0) { unknownOutlets.add(row.outlet); continue; }
-      const i = FL.findIndex((f) => itemKeysMatch(normItem(f[0]), normItem(row.item)));
-      if (i < 0) { unknownItems.add(row.item); continue; }
-      // negative sheet values are system errors: treat as 0 (same rule as the hardcoded data)
-      S[o][i] = Math.max(0, (S[o][i] || 0) + (Number(row.qty) || 0));
-    }
-
-    // fill the hardcoded stores (sheet data always wins when a row exists)
-    const manual = [];
-    for (const [name, stock] of Object.entries(MANUAL_STOCK)) {
-      const o = N.indexOf(name);
+    // newest row per (outlet, flavour): rows arrive stock_date DESC, so the first hit wins
+    for (const row of closingRows || []) {
+      const o = idOf.indexOf(row.outlet_id);
       if (o < 0) continue;
-      stock.forEach((v, i) => {
-        if (v != null && S[o][i] == null) S[o][i] = v;
-      });
-      manual.push(name);
+      const i = FL.findIndex((f) => itemKeysMatch(normItem(f[0]), normItem(row.item_name)));
+      if (i < 0) { unknownItems.add(row.item_name); continue; }
+      if (S[o][i] == null) {
+        S[o][i] = Math.max(0, Number(row.qty) || 0);
+        if (closing[o] == null) closing[o] = row.stock_date;
+      }
     }
 
-    // data gap = an outlet with no sheet rows AND no hardcoded stock
+    // outlets with no closing-stock rows at all fall back to the shared stock sheet
+    const sheet = { used: [], date: "", error: null };
+    const noClosing = N.filter((_n, o) => closing[o] == null);
+    if (noClosing.length) {
+      try {
+        const r = await fetch("/api/stock");
+        const d = await r.json();
+        if (d.error) sheet.error = d.error;
+        else {
+          sheet.date = d.dateCell || "";
+          for (const row of d.stock || []) {
+            const o = noClosing.findIndex((n) => sameOutlet(n, row.outlet));
+            if (o < 0) continue;
+            const outlet = noClosing[o];
+            const i = FL.findIndex((f) => itemKeysMatch(normItem(f[0]), normItem(row.item)));
+            if (i < 0) { unknownItems.add(row.item); continue; }
+            const oi = N.indexOf(outlet);
+            // negative sheet values are system errors: treat as 0
+            S[oi][i] = Math.max(0, (S[oi][i] || 0) + (Number(row.qty) || 0));
+            if (!sheet.used.includes(outlet)) sheet.used.push(outlet);
+          }
+        }
+      } catch (e) {
+        sheet.error = e.message;
+      }
+    }
+
+    // data gap = an outlet with neither closing-stock rows nor sheet rows
     const missing = N.filter((_n, o) => S[o].every((v) => v == null));
 
-    // the table shows numbers, never blanks: a flavour with no sheet row = 0 stock
+    // the table shows numbers, never blanks: no entry for a flavour = 0 stock
     S.forEach((row) => row.forEach((v, i) => {
       if (v == null) row[i] = 0;
     }));
 
-    return {
-      ok: true,
-      date: d.dateCell || "",
-      S,
-      missing,
-      manual,
-      unknownOutlets: [...unknownOutlets],
-      unknownItems: [...unknownItems],
-    };
+    return { ok: true, S, closing, missing, unknownItems: [...unknownItems], sheet };
   } catch (e) {
     return { ...empty, error: e.message };
   }

@@ -42,3 +42,10 @@ next-env.d.ts
 
 # agent log with business details - never goes to the public repo
 /CHANGELOG.md
+
+# SQL migrations with business rules/schema - local only, never goes to the public repo
+*.sql
+
+# planner QA suite + example data with business numbers (prices, caps, sales) - local only
+/app/shipment-planning/planner/plannerExample.js
+/app/shipment-planning/planner/engine.test.mjs

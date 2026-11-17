@@ -184,7 +184,8 @@ const NAV = [
     icon: "send",
     base: "/shipment-planning",
     children: [
-      { href: "/shipment-planning/planner", label: "Send PO (new)" },
+      { href: "/shipment-planning/planner", label: "Planner" },
+      { href: "/shipment-planning/closing-stock", label: "Outlet Closing Stock" },
       { href: "/shipment-planning/po-send", label: "Send PO" },
       { href: "/shipment-planning/trend", label: "Outlet Stock Trend" },
       // { href: "/shipment-planning/plan", label: "Plan Shipment" },

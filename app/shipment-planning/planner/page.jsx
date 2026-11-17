@@ -3,14 +3,23 @@
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  N, Z, FL, PK, GN, DAY,
-  initialStock, initialExtras, initialCK, initialProd, initialWD, initialWE,
-  stk, ckTot, sum, r6, fm, cpt, hv, bcap, dry,
-  cover, rule, optCost, dayPlan, pick, weekRows,
+  N, Z, NEAR, FL, PK, GN, DAY,
+  initialStock, initialExtras, initialCK, initialProd,
+  stk, ckTot,
 } from "./planner";
+import {
+  buildPlan, pick as pickOpt, planOptions, planCost, criticality,
+  routeKm, routeMinutes, projectStock, weekRows as engineWeekRows, addDays, isoDate,
+  dry, bcap, sum, r6, round6, fm, cpt, flPct, isClassic,
+  allocate, vehicleOptions, orderStops,
+} from "./engine";
+import { normItem } from "./nameMatch";
+import { generateDeliveryChallan } from "@/lib/plannerChallan";
 import { fetchCKClosing } from "./ckStock";
 import { fetchOutletStock } from "./outletStock";
 import { fetchOutletConfig } from "./outletConfig";
+import { supabase } from "@/lib/supabaseBrowser";
+import { ENGINE_DEFAULTS, VEHICLES } from "./engine";
 
 // Leaflet touches `window`, so the map only loads in the browser
 const RouteMap = dynamic(() => import("./RouteMap"), {
@@ -99,6 +108,69 @@ function NumInput({ value, onCommit, step, w = "w-16", pill, label }) {
   );
 }
 
+/* text sibling of NumInput (commit on blur / Enter); an empty value is ignored —
+   vehicles.name is NOT NULL in the DB and a blank label would hide the vehicle */
+function TextInput({ value, onCommit, w = "w-40", label }) {
+  const [txt, setTxt] = useState(value);
+  const [focus, setFocus] = useState(false);
+  useEffect(() => {
+    if (!focus) setTxt(value);
+  }, [value, focus]);
+  const commit = () => {
+    const v = txt.trim();
+    if (v && v !== value) onCommit(v);
+  };
+  return (
+    <input
+      type="text"
+      aria-label={label}
+      value={txt}
+      onFocus={() => setFocus(true)}
+      onChange={(e) => setTxt(e.target.value)}
+      onBlur={() => { setFocus(false); commit(); }}
+      onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+      className={`${inp} ${w}`}
+    />
+  );
+}
+
+/* numeric input that may be left empty: "" commits null (the outlets table
+   stores NULL and the engine falls back to the global rules); a typed 0 is a
+   real zero — max send 0 = nothing goes to that outlet, min send 0 = no
+   forced minimum for it */
+function OptNumInput({ value, onCommit, w = "w-16", label }) {
+  const [txt, setTxt] = useState(value == null ? "" : String(value));
+  const [focus, setFocus] = useState(false);
+  useEffect(() => {
+    if (!focus) setTxt(value == null ? "" : String(value));
+  }, [value, focus]);
+  const commit = () => {
+    const raw = txt.trim();
+    if (raw === "") {
+      setTxt("");
+      if (value != null) onCommit(null);
+      return;
+    }
+    const v = Math.max(0, Number(raw) || 0);
+    setTxt(String(v));
+    if (v !== value) onCommit(v);
+  };
+  return (
+    <input
+      type="number"
+      inputMode="numeric"
+      min="0"
+      aria-label={label}
+      value={txt}
+      onFocus={() => setFocus(true)}
+      onChange={(e) => setTxt(e.target.value)}
+      onBlur={() => { setFocus(false); commit(); }}
+      onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+      className={`${inp} ${w}`}
+    />
+  );
+}
+
 /* vehicle dropdown: native <select> popups are OS-drawn and can't be styled, so this
    listbox gives the popup rounded corners, comfortable text and a won't-fit badge */
 function VehicleSelect({ options, value, onChange }) {
@@ -171,7 +243,7 @@ function VehicleSelect({ options, value, onChange }) {
                 }`}
               >
                 <span>{v.l}</span>
-                {!v.valid && <Badge t="red">won’t fit</Badge>}
+                {!v.valid && <Badge t="red">{v.why || "won’t fit"}</Badge>}
               </button>
             );
           })}
@@ -186,13 +258,13 @@ const nextWorkingDay = () => {
   if (d.getDay() == 0) d.setDate(d.getDate() + 1);
   return d.toLocaleDateString("en-CA");
 };
-const round6 = (v) => Math.round(v / 6) * 6;
 
 /* ---------- persistence (localStorage) ---------- */
 
-// Standing parameter edits (stock corrections, sales rates, capacities, days, CKS,
-// production) are saved as per-cell diffs only, so fresh sheet/fetched values still
-// flow in around them. The per-date plan (selection, vehicle picks, quantity
+// Per-cell edits (production rows, stock corrections) are saved as diffs only, so
+// fresh fetched values still flow in around them. Everything else — dispatch rules,
+// outlet sales/capacity/send limits, days of stock, kitchen limit — lives in the
+// database now (⚙ popup). The per-date plan (selection, vehicle picks, quantity
 // overrides, CK/packaging corrections) lives under its own key per dispatch date.
 const PKEY = "planner_params_v1";
 const planKey = (date) => "planner_plan_v1_" + date;
@@ -214,31 +286,39 @@ const with1d = (a, ed) => (ed ? a.map((v, i) => (ed[i] != null ? ed[i] : v)) : a
 
 const dateLabel = (d) => DAY[d.getDay()] + " " + d.toLocaleDateString("en-GB");
 
-function tripCopyText(ti, t, c, km, P, d) {
+/* One trip's packing list. A return-run option has two legs (near first, then far);
+   its boxes are aligned to the legs' stops, not to the trip's original order. */
+function tripCopyText(ctx, ti, t, c, km, P, d) {
   const pk = c.pk ? ` + ${fm(c.pk)} ${c.m == "c" ? "cartons" : "ice"}` : "";
+  const legs = c.returnRun ? c.runs : [{ ids: t.ids, bx: c.bx, label: null }];
   const lines = [
     `Trip ${ti + 1} · ${dateLabel(d)} — ${c.l} (${fm(c.veh)}${pk}) · ${Math.round(km)} km`,
-    "Kitchen → " + t.ids.map((o) => N[o]).join(" → "),
   ];
-  t.ids.forEach((o, i) => {
-    const bx = c.bx[i];
+  legs.forEach((leg, li) => {
     lines.push(
-      "",
-      `${N[o]} — ${P.u[o]} tarts · ${c.m == "c" ? bx.c + (bx.c == 1 ? " carton" : " cartons") : bx.a + " × 60L + " + bx.b + " × 30L"}` +
-        (c.m == "t" ? ` · ice ${dry(o, bx).toFixed(1)} kg` : "")
+      (c.returnRun ? `${leg.label || "Leg " + (li + 1)}: K` : "K") + "itchen → " +
+        leg.ids.map((o) => N[o]).join(" → ")
     );
-    FL.forEach((f, fi) => {
-      if (P.q[o][fi] > 0) lines.push(`  ${f[0]} — ${P.q[o][fi]}`);
+    leg.ids.forEach((o, i) => {
+      const bx = leg.bx[i];
+      lines.push(
+        "",
+        `${N[o]} — ${P.u[o] || 0} tarts · ${c.m == "c" ? bx.c + (bx.c == 1 ? " carton" : " cartons") : bx.a + " × 60L + " + bx.b + " × 30L"}` +
+          (c.m == "t" ? ` · ice ${dry(ctx, o, bx).toFixed(1)} kg` : "")
+      );
+      (P.q[o] || []).forEach((q, fi) => {
+        if (q > 0) lines.push(`  ${FL[fi][0]} — ${q}`);
+      });
     });
   });
   return lines.join("\n");
 }
 
-function allTripsCopyText(view, d) {
+function allTripsCopyText(ctx, view, d) {
   const head =
     `Dispatch ${dateLabel(d)} · ${view.trips.length} trip${view.trips.length == 1 ? "" : "s"}` +
     ` · ${view.totU} tarts · ${fm(view.tot)}`;
-  return [head].concat(view.trips.map(({ t, c, km }, ti) => tripCopyText(ti, t, c, km, view.P, d))).join("\n\n");
+  return [head].concat(view.trips.map(({ t, c, km }, ti) => tripCopyText(ctx, ti, t, c, km, view.P, d))).join("\n\n");
 }
 
 // same fallback pattern as the Shopify orders page (kept local on purpose — small)
@@ -264,26 +344,57 @@ async function copyToClipboard(text) {
 
 export default function PlannerPage() {
   const [date, setDate] = useState("");
-  const [days, setDays] = useState(2);
+  // settings v8: every global value lives in the planner_settings DB row (editable in
+  // the ⚙ popup — nothing in localStorage or code). R (below) merges the row over the
+  // engine's built-in defaults while it loads / until the migration has run.
   const [S, setS] = useState(initialStock);
   const [PS, setPS] = useState(initialExtras);
   const [PQ, setPQ] = useState(initialExtras);
   const [CK, setCK] = useState(initialCK);
   const [PROD, setPROD] = useState(initialProd);
-  const [WD, setWD] = useState(initialWD);
-  const [WE, setWE] = useState(initialWE);
-  const [capw, setCapw] = useState(() => N.map(() => null)); // filled from the outlets table
-  const [CKS, setCKS] = useState(4000);
+  // outlet sales averages + freezer capacity + send limits come only from the outlets
+  // table (weekday_avg / weekend_avg / fridge_capacity / min_send_qty / max_send_qty);
+  // null = still loading — the plan stays blocked until the whole config has arrived
+  const [WD, setWD] = useState(null);
+  const [WE, setWE] = useState(null);
+  const [capw, setCapw] = useState(null);
+  const [mins, setMins] = useState(null); // outlets.min_send_qty per outlet (null entry = off)
+  const [maxs, setMaxs] = useState(null); // outlets.max_send_qty per outlet (null entry = off)
+  // company + FSSAI for the delivery challans come from the brands table (Taatsu row)
+  const [brand, setBrand] = useState(null);
   // source info for the Kitchen "In CK" values (last day's closing stock from the daily stock report)
   const [ckInfo, setCkInfo] = useState(null);
-  // source info for the outlet stock table (shared stock sheet, same import as the PO page)
-  const [sheetInfo, setSheetInfo] = useState(null);
+  // source info for the outlet stock table (stores_closing_stock entries, sheet fallback)
+  const [stockInfo, setStockInfo] = useState(null);
   // outlet coordinates + freezer capacity come only from the `outlets` table (no built-in
   // copies in code — the table is the single source). Until a complete config arrives the
   // plan stays hidden behind a clear error card instead of falling back to stale numbers.
   const [LLS, setLLS] = useState(null);
   const [KITP, setKITP] = useState(null);
   const [configInfo, setConfigInfo] = useState(null);
+  // outlets-table extras for the Send PO payload + delivery challans
+  const [addr, setAddr] = useState(null);
+  const [ids, setIds] = useState(null);
+  const [poc, setPoc] = useState(null);
+  // SKU codes from the items table (delivery challans); {} until the fetch lands
+  const [skus, setSkus] = useState({});
+  // Sunday emergency dispatch (spec section 13: kitchen closed — the page shows Monday's
+  // plan and only dispatches today when the owner presses the button)
+  const [forceSunday, setForceSunday] = useState(false);
+  // Send PO state
+  const [sending, setSending] = useState(false);
+  const [sendMsg, setSendMsg] = useState(null);
+
+  // dispatch rules — global values from `planner_settings` row 1 (radius km, minimum
+  // tarts) and per-vehicle rows from the `vehicles` table (migration v7). null =
+  // still loading, {} = nothing in the DB yet (the engine's built-in values apply).
+  // The ⚙ popup in the page header edits both tables.
+  const [rules, setRules] = useState(null);
+  const [rulesInfo, setRulesInfo] = useState(null);
+  const [VEH, setVEH] = useState(null);
+  const [vehInfo, setVehInfo] = useState(null);
+  const [rulesMsg, setRulesMsg] = useState(null);
+  const [rulesOpen, setRulesOpen] = useState(false);
 
   const [optIdx, setOptIdx] = useState(0); // -1 = outlets picked by hand
   const [manual, setManual] = useState([]);
@@ -291,6 +402,13 @@ export default function PlannerPage() {
   const [OV, setOV] = useState({});
   const [OVB, setOVB] = useState({});
   const [OVT, setOVT] = useState({});
+  // manual trips ("+ Add trip"): one entry per extra run the owner dispatches
+  // themselves — { vk: vehicle key, ids: outlet indexes }. The outlets on a
+  // manual trip leave the auto plan and its quantities; the vehicle is fixed
+  // (stored here, not in SELV, so redo() cannot lose it). Saved per date.
+  const [EXTRAS, setEXTRAS] = useState([]);
+  // the "+ Add trip" form: null = closed, else { vk, ids } while composing
+  const [newTrip, setNewTrip] = useState(null);
   // quantities accordion: the one fold that is open (outlet index; -1 = none; null = not initialized yet)
   const [openOutlet, setOpenOutlet] = useState(null);
   // copy feedback: "all" or the trip index that just copied
@@ -301,17 +419,36 @@ export default function PlannerPage() {
   // date is set on the client only (avoids a server/client date mismatch)
   useEffect(() => setDate(nextWorkingDay()), []);
 
-  // saved parameter edits are merged over the defaults on load (per-cell diffs only,
-  // so the sheet and the stock report stay the live sources for everything else)
+  // saved per-cell edits (production rows, stock corrections) are merged over the
+  // fetched values on load. Everything else lives in the database now (⚙ popup).
   useEffect(() => {
     const p = readJSON(PKEY);
-    if (p.days) setDays(p.days);
-    if (p.CKS) setCKS(p.CKS);
-    if (p.wd) setWD((a) => with1d(a, p.wd));
-    if (p.we) setWE((a) => with1d(a, p.we));
-    if (p.capw) setCapw((a) => with1d(a, p.capw));
     if (p.prod) setPROD((a) => with1d(a, p.prod));
     if (p.stock) setS((m) => withEdits(m, p.stock));
+  }, []);
+
+  // challan company + FSSAI come from the brands table (the Taatsu row)
+  useEffect(() => {
+    supabase
+      .from("brands")
+      .select("brand_name,company,fssai_no")
+      .eq("brand_name", "Taatsu")
+      .maybeSingle()
+      .then(({ data }) => setBrand(data || null));
+  }, []);
+
+  // SKU codes for the delivery challans come from the items table (anon-readable)
+  useEffect(() => {
+    fetch("/api/items")
+      .then((r) => r.json())
+      .then((j) => {
+        const m = {};
+        (j.items || []).forEach((it) => {
+          if (it.sku) m[normItem(it.item_name)] = it.sku;
+        });
+        setSkus(m);
+      })
+      .catch(() => {});
   }, []);
 
   // Kitchen "In CK" starts from the real last-day closing stock (daily stock report "Opening",
@@ -334,35 +471,50 @@ export default function PlannerPage() {
     };
   }, [date]);
 
-  // outlet stock comes from the shared stock sheet (same import as the PO page); the sheet
-  // lists every SKU an outlet carries, so a missing outlet+flavour row means "not carried"
+  // outlet stock comes from the stores_closing_stock table (entries the outlet team
+  // makes on the Closing Stock page); outlets without entries fall back to the shared
+  // stock sheet. Changing the plan date re-fetches (newer entries may have appeared).
   useEffect(() => {
+    if (!date) return;
     let alive = true;
-    fetchOutletStock().then((r) => {
+    setStockInfo(null);
+    fetchOutletStock(date).then((r) => {
       if (!alive) return;
-      setSheetInfo(r);
+      setStockInfo(r);
       if (r.ok && r.S) {
-        // saved per-cell stock corrections stay on top of the fresh sheet values
+        // saved per-cell stock corrections stay on top of the fetched values
         setS(withEdits(r.S, readJSON(PKEY).stock));
         redo(); // stock changed -> re-pick outlets and drop overrides (same rule as manual edits)
       }
+    }).catch(() => {
+      if (alive) setStockInfo({ ok: false, S: null, closing: N.map(() => null), missing: [], unknownItems: [], sheet: { used: [], date: "", error: null }, error: "unexpected error" });
     });
     return () => {
       alive = false;
     };
-  }, []);
-
-  // load outlet coordinates + freezer capacity from the `outlets` table (also the Retry
-  // button on the config card). A capacity change re-picks outlets, the same as a manual
-  // edit. Runs before the plan restore below (its gate waits for configInfo).
+  }, [date]);
+  // load the outlets table config (coordinates, capacity, sales, send limits — also the
+  // Retry button on the config card). A capacity change re-picks outlets, the same as a
+  // manual edit. Runs before the plan restore below (its gate waits for configInfo).
   const loadConfig = () => {
     fetchOutletConfig().then((r) => {
       setConfigInfo(r);
       if (r.ok && r.cfg) {
-        setLLS(r.cfg.ll);
+        // a missing coordinate falls back to the kitchen's — the outlet still plans
+        // (its routes are just approximate) and the gaps card below names it
+        setLLS(r.cfg.ll.map((v) => v || r.cfg.kit || null));
         setKITP(r.cfg.kit);
-        // saved per-cell capacity corrections stay on top of the DB values
-        setCapw(with1d(r.cfg.capw, readJSON(PKEY).capw));
+        setAddr(r.cfg.addr);
+        setIds(r.cfg.ids);
+        setPoc(r.cfg.poc);
+        setMins(r.cfg.mins);
+        setMaxs(r.cfg.maxs);
+        // real sales averages + freezer capacity + send limits from the outlets table
+        // (no localStorage copies). A single missing sales value blocks the plan — the
+        // config card below names the gaps instead of planning on stale numbers.
+        if (Array.isArray(r.cfg.wd) && r.cfg.wd.every((v) => v != null)) setWD(r.cfg.wd);
+        if (Array.isArray(r.cfg.we) && r.cfg.we.every((v) => v != null)) setWE(r.cfg.we);
+        setCapw(r.cfg.capw);
         redo(); // capacity changed -> re-pick outlets and drop overrides
         restored.current = null; // re-apply the saved plan on top of the fresh config (Retry)
       }
@@ -372,60 +524,287 @@ export default function PlannerPage() {
     loadConfig();
   }, []);
 
-  const d = useMemo(() => (date ? new Date(date + "T00:00") : null), [date]);
-  const st = useMemo(() => N.map((_n, o) => stk(S, o)), [S]);
-  const ctx = useMemo(() => ({ S, OV, OVB, OVT, CK, WD, WE, CAPW: capw, DAYS: days, LL: LLS, KIT: KITP }), [S, OV, OVB, OVT, CK, WD, WE, capw, days, LLS, KITP]);
-  const sunday = d ? d.getDay() == 0 : false;
-  // the mapped outlets-table config; the plan only renders once every outlet has
-  // coordinates and freezer capacity in the table (there are no built-in fallback values)
-  const cfg = configInfo && configInfo.ok ? configInfo.cfg : null;
-  const configOk = !!LLS && LLS.every(Boolean) && !!KITP && capw.length == N.length && capw.every((v) => v != null);
+  // global values from planner_settings row 1 (migrations v8 + v9): dispatch rules,
+  // shelf life, route limit, challan expiry, kitchen storage limit, packaging
+  // prices. select("*") so a migration that added columns but was not run yet is
+  // not fatal — the missing keys fall back to the engine's built-in values.
+  const loadRules = () => {
+    supabase
+      .from("planner_settings")
+      .select("*")
+      .eq("id", 1)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (error) {
+          setRules({});
+          setRulesInfo({ ok: false, error: error.message });
+          return;
+        }
+        setRules({
+          ...(data && data.eco_radius_km != null ? { ecoRadiusKm: Number(data.eco_radius_km) } : {}),
+          ...(data && data.min_tarts_per_outlet != null ? { minTartsPerOutlet: Number(data.min_tarts_per_outlet) } : {}),
+          ...(data && data.days_of_stock != null ? { daysOfStock: Number(data.days_of_stock) } : {}),
+          ...(data && data.shelf_life_days != null ? { shelfLifeDays: Number(data.shelf_life_days) } : {}),
+          ...(data && data.cks_limit != null ? { cksLimit: Number(data.cks_limit) } : {}),
+          // route_time_limit_min / challan_expiry_days are no longer settings:
+          // the owner says a late shipment is not our concern, and the challan
+          // expiry is a fixed 30 days (the engine's built-in values apply)
+          ...(data && data.carton_rs != null ? { cartonRs: Number(data.carton_rs) } : {}),
+          ...(data && data.dry_ice_rs_per_kg != null ? { dryIceRsPerKg: Number(data.dry_ice_rs_per_kg) } : {}),
+          ...(data && data.trays_per_carton != null ? { traysPerCarton: Number(data.trays_per_carton) } : {}),
+        });
+        setRulesInfo({ ok: true, error: null });
+      });
+  };
 
-  // outlet options come straight from the stock, sales rates and days-of-stock setting
-  const OPTS = useMemo(() => (d && !sunday ? rule({ WD, WE, DAYS: days }, st, d) : []), [d, sunday, st, WD, WE, days]);
+  // per-vehicle rule rows from the `vehicles` table, keyed for the engine (ctx.VEH)
+  const loadVehicles = () => {
+    supabase
+      .from("vehicles")
+      .select("*")
+      .eq("is_active", true)
+      .then(({ data, error }) => {
+        if (error) {
+          setVEH({});
+          setVehInfo({ ok: false, error: error.message });
+          return;
+        }
+        const m = {};
+        (data || []).forEach((r) => {
+          m[r.key] = {
+            ...(r.name ? { l: r.name } : {}),
+            ...(r.box_capacity != null ? { cap: Number(r.box_capacity) } : {}),
+            ...(r.flat_fare != null ? { flat: Number(r.flat_fare) } : {}),
+            ...(r.pune_flat_fare != null ? { puneFlat: Number(r.pune_flat_fare) } : {}),
+            ...(r.min_stops != null ? { minStops: Number(r.min_stops) } : {}),
+            ...(r.max_stops != null ? { maxStops: Number(r.max_stops) } : {}),
+            ...(r.max_near_stops != null ? { maxNear: Number(r.max_near_stops) } : {}),
+            ...(r.max_far_stops != null ? { maxFar: Number(r.max_far_stops) } : {}),
+          };
+        });
+        setVEH(m);
+        setVehInfo({ ok: true, error: null, n: (data || []).length });
+      });
+  };
+  useEffect(() => {
+    loadRules();
+    loadVehicles();
+  }, []);
+
+  // commit a global setting: apply locally (the plan updates immediately) and
+  // persist to planner_settings row 1. On failure the badge says so and we re-read.
+  const saveSetting = async (col, localKey, v) => {
+    setRulesMsg({ ok: null, text: "saving…" });
+    const { data: cur, error: e0 } = await supabase.from("planner_settings").select("*").eq("id", 1).maybeSingle();
+    let error = e0;
+    if (!error) {
+      const row = { id: 1, ...(cur || {}), [col]: v, updated_at: new Date().toISOString() };
+      ({ error } = await supabase.from("planner_settings").upsert(row));
+    }
+    if (error) {
+      setRulesMsg({ ok: false, text: "save failed — " + error.message });
+      loadRules();
+      return;
+    }
+    setRules((r) => ({ ...(r || {}), [localKey]: v }));
+    setRulesMsg({ ok: true, text: "saved ✓" });
+  };
+
+  // commit a vehicle row (col = name / box_capacity / flat_fare / pune_flat_fare /
+  // max_stops / max_near_stops / max_far_stops). The fallback row only matters if
+  // the vehicle's row is missing — it must satisfy the NOT NULLs.
+  const saveVehicle = async (vk, col, localKey, v) => {
+    setRulesMsg({ ok: null, text: "saving…" });
+    const { data: cur, error: e0 } = await supabase.from("vehicles").select("*").eq("key", vk).maybeSingle();
+    let error = e0;
+    if (!error) {
+      const row = { ...(cur || { key: vk, name: VEHICLES[vk].l, min_stops: 1, max_stops: VEHICLES[vk].maxStops, is_active: true }), [col]: v, updated_at: new Date().toISOString() };
+      ({ error } = await supabase.from("vehicles").upsert(row));
+    }
+    if (error) {
+      setRulesMsg({ ok: false, text: "save failed — " + error.message });
+      loadVehicles();
+      return;
+    }
+    setVEH((m) => ({ ...(m || {}), [vk]: { ...(m?.[vk] || {}), [localKey]: v } }));
+    setRulesMsg({ ok: true, text: "saved ✓" });
+  };
+
+  // commit one outlets-table value (col = weekday_avg / weekend_avg / fridge_capacity /
+  // min_send_qty / max_send_qty) for outlet index o. min/max 0 = off → stored as NULL.
+  // Every commit re-picks outlets (sales or room changed) and the badge reports it.
+  const saveOutlet = async (o, col, localKey, v) => {
+    const id = ids?.[o];
+    if (id == null) {
+      setRulesMsg({ ok: false, text: N[o] + ": no row in the outlets table" });
+      return;
+    }
+    setRulesMsg({ ok: null, text: "saving…" });
+    // min/max send: empty commits null (off — the global rules apply); a typed 0
+    // is a real zero (max 0 = send nothing, min 0 = no forced minimum)
+    const off = localKey == "mins" || localKey == "maxs";
+    const dbv = off ? (v == null ? null : v) : v;
+    const { error } = await supabase.from("outlets").update({ [col]: dbv }).eq("id", id);
+    if (error) {
+      setRulesMsg({ ok: false, text: "save failed — " + error.message });
+      loadConfig(); // re-read the table so the UI matches the database again
+      return;
+    }
+    if (localKey == "wd") set1d(setWD, o, v);
+    else if (localKey == "we") set1d(setWE, o, v);
+    else if (localKey == "capw") set1d(setCapw, o, v);
+    else if (localKey == "mins") set1d(setMins, o, dbv);
+    else if (localKey == "maxs") set1d(setMaxs, o, dbv);
+    redo();
+    setRulesMsg({ ok: true, text: "saved ✓" });
+  };
+
+  const d = useMemo(() => (date ? new Date(date + "T00:00") : null), [date]);
+  const sunday = d ? d.getDay() == 0 : false;
+
+  // On Sunday the plan is built for Monday morning: existing stock minus Sunday's
+  // expected sales, per flavour (weekend rate × the flavour's share of the mix).
+  const mondayS = useMemo(() => {
+    if (!sunday || !WE) return S;
+    const tp = sum(FL.filter(isClassic).map(flPct)) || 1;
+    return S.map((r, o) =>
+      r.map((v, i) =>
+        v == null ? null : Math.max(0, Math.round(v - (WE[o] || 0) * (isClassic(FL[i]) ? flPct(FL[i]) / tp : 0)))
+      )
+    );
+  }, [S, sunday, WE]);
+  const effS = mondayS;
+  const effSt = useMemo(() => N.map((_n, o) => stk(effS, o)), [effS]);
+  const effD = d && sunday ? addDays(d, 1) : d;
+
+  // the global settings as shown everywhere on the page: the planner_settings DB row
+  // over the engine's built-in defaults
+  const R = { ...ENGINE_DEFAULTS, ...(rules || {}) };
+  const D = R.daysOfStock;
+
+  const ctx = useMemo(
+    () => ({
+      N, Z, NEAR, CITY: N.map((_n, o) => (Z[o] == "P" ? "Pune" : "Mumbai")), FL,
+      S: effS, CK, WD, WE, CAPW: capw, LL: LLS, KIT: KITP, CKS: R.cksLimit, DAYS: D,
+      MIN: mins, MAX: maxs, OV, OVB, OVT, VEH,
+      SET: { ...(rules || {}) },
+    }),
+    [effS, CK, WD, WE, capw, mins, maxs, D, R.cksLimit, LLS, KITP, OV, OVB, OVT, rules, VEH]
+  );
+
+  // the mapped outlets-table config; the plan only renders once every outlet has
+  // coordinates, freezer capacity and sales averages in the table (there are no
+  // built-in fallback values)
+  const cfg = configInfo && configInfo.ok ? configInfo.cfg : null;
+  const configOk =
+    !!LLS && LLS.every(Boolean) && !!KITP &&
+    !!capw && capw.length == N.length && capw.every((v) => v != null) &&
+    !!WD && WD.every((v) => v != null) &&
+    !!WE && WE.every((v) => v != null);
+  // one vehicle's effective row (DB `vehicles` row over the built-in constants)
+  const V = (k) => ({ ...VEHICLES[k], ...(VEH?.[k] || {}) });
+  const planning = !!d && (!sunday || forceSunday);
+
+  // which outlets go today: the v6 options (critical-only, + low flavours, or the
+  // fallbacks when nothing is critical). Sunday emergency builds them for Monday.
+  const OPTS = useMemo(
+    () => (planning ? planOptions(ctx, effSt, effD) : []),
+    [planning, ctx, effSt, effD]
+  );
   const SEL = optIdx >= 0 ? (OPTS[optIdx] ? OPTS[optIdx].ids : []) : manual;
   const FORCE = optIdx >= 0 && OPTS[optIdx] ? OPTS[optIdx].f : null;
 
-  // restore this date's saved plan once every data source (outlets config, stock sheet,
-  // CK opening) has settled — the sheet/config loads' redo() above drops overrides, so
+  // restore this date's saved plan once every data source (outlets config, closing
+  // stock, CK opening) has settled — the loaders' redo() above drops overrides, so
   // this runs after them.
   // Declared after OPTS because the deps array reads OPTS during render.
   useEffect(() => {
-    if (!date || sheetInfo == null || ckInfo == null || configInfo == null || restored.current === date) return;
+    if (!date || stockInfo == null || ckInfo == null || configInfo == null || restored.current === date) return;
     restored.current = date;
     const p = readJSON(planKey(date));
     if (p.OV) setOV(p.OV);
     if (p.OVB) setOVB(p.OVB);
     if (p.OVT) setOVT(p.OVT);
     if (p.SELV) setSELV(p.SELV);
+    if (p.EXTRAS) setEXTRAS(Array.isArray(p.EXTRAS) ? p.EXTRAS : []);
     if (p.manual) { setManual(p.manual); setOptIdx(-1); }
     else if (typeof p.optIdx == "number" && p.optIdx >= 0 && (!p.optLabel || (OPTS[p.optIdx] ? OPTS[p.optIdx].l : null) == p.optLabel)) setOptIdx(p.optIdx);
     if (p.ck) setCK((a) => with1d(a, p.ck));
     if (p.ps) setPS((m) => withEdits(m, p.ps));
     if (p.pq) setPQ((m) => withEdits(m, p.pq));
-  }, [date, sheetInfo, ckInfo, configInfo, OPTS]);
+  }, [date, stockInfo, ckInfo, configInfo, OPTS]);
 
   const view = useMemo(() => {
-    if (!d || sunday || !configOk) return null;
-    const P = dayPlan(ctx, SEL, true, st, d);
-    let totU = 0, veh = 0, dkg = 0, dkc = 0, ctc = 0;
-    const trips = P.trips.map((t) => {
-      const c = pick(t, true, FORCE, SELV);
-      const km = sum(t.ids.map((o, i) => hv(i ? LLS[t.ids[i - 1]] : KITP, LLS[o])));
-      veh += c.veh; totU += t.U;
-      if (c.m == "t") { dkg += c.pk / 90; dkc += c.pk; } else ctc += c.pk;
-      return { t, c, over: c.used - c.cap, km };
-    });
-    const snd = FL.map((_f, i) => sum(SEL.map((o) => P.q[o][i])));
-    const ckT = ckTot(CK), sT = sum(snd);
-    const fillNeed = sum(SEL.map((o) => r6(capw[o] - st[o])));
-    return {
-      P, trips, totU, veh, dkg, dkc, ctc, tot: veh + dkc + ctc,
-      snd, ckT, sT, left: ckT - sT, short: Math.max(0, fillNeed - ckT),
-      costs: OPTS.map((op) => optCost(ctx, op, st, d)),
-      week: weekRows(ctx, P, PROD, SELV, FORCE, date),
+    if (!d || !planning || !configOk) return null;
+    // manual trips: the outlets they carry leave the auto plan entirely (they
+    // cannot ride both), and each extra run is one row in EXTRAS
+    const moved = (EXTRAS || []).flatMap((e) => e.ids || []);
+    const P = buildPlan(ctx, SEL.filter((o) => !moved.includes(o)), effSt, effD, true);
+    // quantities for the manual runs: the same allocation rules (shelf-life
+    // fill, per-outlet min/max, typed overrides) continuing from the auto
+    // plan's leftover kitchen stock, so nothing is counted twice
+    const mAlloc = moved.length
+      ? allocate(ctx, moved, effSt, effD, true, P.ckLeft.slice())
+      : { q: {}, u: {}, T: {}, left: P.ckLeft };
+    const mTrips = (EXTRAS || []).map((e, i) => {
+      const ids = orderStops(ctx, (e.ids || []).filter((o) => o != null));
+      if (!ids.length) return null;
+      const perOutlet = Object.fromEntries(ids.map((o) => [o, mAlloc.u[o] || 0]));
+      const opts = vehicleOptions(ctx, ids, perOutlet, true, "mumbai");
+      const c = opts.find((x) => x.k === e.vk) || opts[0];
+      const U = sum(ids.map((o) => mAlloc.u[o] || 0));
+      const t = { key: "x" + i, ids, kind: c.pune ? "pune" : "mumbai", manual: true, U, o: opts };
+      t.noFit = !opts.some((x) => x.valid);
+      return { t, c, stops: ids, km: routeKm(ctx, ids), mins: routeMinutes(ctx, ids), U, over: c.used - c.cap };
+    }).filter(Boolean);
+    // the merged plan the rest of the page works off (challans, PO, week table)
+    const P2 = {
+      ...P,
+      q: { ...P.q, ...mAlloc.q },
+      u: { ...P.u, ...mAlloc.u },
+      trips: [...P.trips, ...mTrips.map((x) => x.t)],
+      ids: [...P.ids, ...mTrips.flatMap((x) => x.stops)],
     };
-  }, [d, sunday, ctx, SEL, SELV, FORCE, st, capw, CK, PROD, OPTS, date, LLS, KITP, configOk]);
+    P2.tot = sum(P2.ids.map((o) => P2.u[o] || 0));
+    let totU = 0, veh = 0, dkg = 0, dkc = 0, ctc = 0, tot = 0;
+    const trips = P2.trips.map((t) => {
+      const mt = t.manual ? mTrips.find((x) => x.t.key === t.key) : null;
+      const c = mt ? mt.c : pickOpt(t, true, FORCE, SELV);
+      const stops = c.returnRun ? c.runs.flatMap((r) => r.ids) : t.ids;
+      const km = c.returnRun ? sum(c.runs.map((r) => routeKm(ctx, r.ids))) : routeKm(ctx, t.ids);
+      const mins = c.returnRun ? sum(c.runs.map((r) => routeMinutes(ctx, r.ids))) : routeMinutes(ctx, t.ids);
+      const U = c.returnRun ? c.U : t.U;
+      totU += U; veh += c.veh; tot += c.c;
+      if (c.m == "t") { dkg += c.pk / 90; dkc += c.pk; } else ctc += c.pk;
+      return { t, c, stops, km, mins, U, over: c.used - c.cap };
+    });
+    const chosenIds = trips.flatMap((x) => x.stops);
+    const snd = FL.map((_f, i) => sum(chosenIds.map((o) => (P2.q[o] || [])[i] || 0)));
+    const ckT = ckTot(CK), sT = sum(snd);
+    // tomorrow preview: stock after today's dispatch, then tomorrow's sales
+    const tmSt = projectStock(ctx, effSt, effD, Object.fromEntries(chosenIds.map((o) => [o, P2.u[o] || 0])), addDays(effD, 1));
+    const tmInfo = criticality(ctx, tmSt, addDays(effD, 1));
+    return {
+      P: P2, trips, totU, veh, dkg, dkc, ctc, tot,
+      snd, ckT, sT, left: ckT - sT,
+      chosenIds,
+      tmCritical: tmInfo.filter((x) => x.critical),
+      costs: OPTS.map((op) => {
+        if (!op.ids.length) return null;
+        const p2 = buildPlan(ctx, op.ids, effSt, effD, false);
+        const cc = planCost(ctx, p2, {}, op.f);
+        return cc.tarts ? cc.cpt : null;
+      }),
+      week: engineWeekRows(ctx, P2, PROD, { ...SELV, ...Object.fromEntries(mTrips.map((x) => [x.t.key, x.c.k])) }, FORCE, isoDate(effD)),
+    };
+  }, [d, planning, configOk, ctx, SEL, SELV, FORCE, EXTRAS, effSt, effD, capw, CK, PROD, OPTS, LLS, KITP]);
+
+  // Sunday preview: which outlets would be critical on Monday (shown while the
+  // kitchen is closed, before the owner decides on an emergency dispatch)
+  const sunPreview = useMemo(
+    () => (d && sunday ? criticality(ctx, effSt, effD).filter((x) => x.critical) : []),
+    [d, sunday, ctx, effSt, effD]
+  );
 
   /* ----- edits (same rules as the HTML) ----- */
 
@@ -448,11 +827,6 @@ export default function PlannerPage() {
     const p = readJSON(PKEY);
     p[field] = p[field] || {};
     p[field][key] = v;
-    writeJSON(PKEY, p);
-  };
-  const saveParamS = (key, v) => {
-    const p = readJSON(PKEY);
-    p[key] = v;
     writeJSON(PKEY, p);
   };
   // the stored plan with overrides cleared — mirrors what redo() does to state
@@ -480,6 +854,24 @@ export default function PlannerPage() {
     setSELV({});
     savePlan({ optIdx: -1, optLabel: null, manual: m, SELV: {} });
   };
+
+  /* ----- manual trips ("+ Add trip" in the Vehicles section) ----- */
+
+  // persist EXTRAS and mirror it into this date's saved plan
+  const saveExtras = (nE) => {
+    setEXTRAS(nE);
+    savePlan({ EXTRAS: nE });
+  };
+  // commit the "+ Add trip" form: { vk, ids } — the vehicle and the outlets
+  const addExtra = () => {
+    const ids = (newTrip.ids || []).filter((o) => o != null && !EXTRAS.some((e) => (e.ids || []).includes(o)));
+    if (!newTrip.vk || !ids.length) return;
+    saveExtras(EXTRAS.concat({ vk: newTrip.vk, ids }));
+    setNewTrip(null);
+  };
+  const removeExtra = (i) => saveExtras(EXTRAS.filter((_e, j) => j != i));
+  // change a manual trip's vehicle (stored in EXTRAS — redo() must not lose it)
+  const setExtraVeh = (i, vk) => saveExtras(EXTRAS.map((e, j) => (j == i ? { ...e, vk } : e)));
   const del = (obj, k) => { const n = { ...obj }; delete n[k]; return n; };
   const editTotal = (o, v) => {
     const nT = { ...OVT, [o]: round6(v) };
@@ -518,6 +910,88 @@ export default function PlannerPage() {
     setTimeout(() => setCopied((c) => (c === key ? null : c)), 1600);
   };
 
+  /* ----- Send PO + delivery challans (spec sections 15-16) ----- */
+
+  const challanItems = (o) => [
+    ...FL.map((f, i) => ({ name: f[0], sku: skus[normItem(f[0])] || null, qty: (view?.P.q[o] || [])[i] || 0, unit: "piece" })),
+    ...PK.map((n, j) => ({ name: n, sku: null, qty: (PQ[o] || [])[j] || 0, unit: "piece" })),
+    ...GN.map((n, k) => ({ name: n, sku: null, qty: (PQ[o] || [])[k + 4] || 0, unit: "gram" })),
+  ].filter((x) => x.qty > 0);
+
+  const downloadChallans = () => {
+    if (!view) return;
+    let n = 0;
+    view.trips.forEach(({ t, c }) => {
+      const stops = c.returnRun ? c.runs.flatMap((r) => r.ids) : t.ids;
+      stops.forEach((o) => {
+        const items = challanItems(o);
+        if (!items.length) return;
+        n++;
+        generateDeliveryChallan({
+          outletName: N[o],
+          outletAddress: (addr && addr[o]) || "",
+          outletContact: (poc && poc[o]) || "",
+          items,
+          dispatchDate: date,
+          company: brand?.company || undefined,
+          fssai: brand?.fssai_no != null ? String(brand.fssai_no) : "",
+          expiryDays: R.challanExpiryDays,
+        });
+      });
+    });
+    return n;
+  };
+
+  const sendPo = async () => {
+    if (!view || !view.trips.length) return;
+    setSending(true);
+    setSendMsg(null);
+    const payload = {
+      dispatch_date: date,
+      total_tarts: view.totU,
+      total_cost: view.tot,
+      cost_per_tart: view.totU ? view.tot / view.totU : null,
+      dry_ice_kg: view.dkg,
+      challan_expiry_days: R.challanExpiryDays,
+      plan_json: {
+        date, sel: SEL, force: FORCE,
+        trips: view.trips.map(({ t, c }) => ({ kind: t.kind, ids: t.ids, k: c.k, l: c.l })),
+        q: view.P.q, u: view.P.u, tot: view.totU,
+      },
+      trips: view.trips.map(({ t, c }) => ({
+        vehicle_key: c.k,
+        vehicle_label: c.l,
+        stops: (c.returnRun ? c.runs.flatMap((r) => r.ids) : t.ids).map((o) => ({
+          outlet: N[o],
+          outlet_id: (ids && ids[o]) ?? null,
+          address: (addr && addr[o]) || null,
+          contact: (poc && poc[o]) || null,
+          tarts: view.P.u[o] || 0,
+          items: FL.map((f, i) => ({ name: f[0], qty: (view.P.q[o] || [])[i] || 0 })).filter((x) => x.qty > 0),
+          packaging: PK.map((n, j) => ({ name: n, qty: (PQ[o] || [])[j] || 0 })).filter((x) => x.qty > 0),
+          garnishing: GN.map((n, k) => ({ name: n, qty: (PQ[o] || [])[k + 4] || 0 })).filter((x) => x.qty > 0),
+        })),
+      })),
+    };
+    try {
+      const res = await fetch("/api/planner/dispatch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setSendMsg({ ok: false, text: j.error || "Send failed (" + res.status + ")" });
+      } else {
+        const n = downloadChallans();
+        setSendMsg({ ok: true, text: `Plan #${j.id} saved (${j.items_saved} item rows). ${n} challan${n == 1 ? "" : "s"} downloading…` });
+      }
+    } catch (e) {
+      setSendMsg({ ok: false, text: e.message });
+    }
+    setSending(false);
+  };
+
   if (!date) return <div className="full-bleed min-h-screen bg-slate-50 p-6 pt-20 text-sm text-slate-500 md:p-10">Loading…</div>;
 
   return (
@@ -525,22 +999,22 @@ export default function PlannerPage() {
       <div className="mx-auto max-w-[1100px] px-3 sm:px-5">
         {/* header */}
         <header className="flex flex-wrap items-center justify-between gap-3 py-4">
-          <h1 className="text-lg font-semibold tracking-tight">Shipment planner</h1>
+          <h1 className="text-lg font-semibold tracking-tight">Dispatch plan · {dateLabel(d)}</h1>
           <div className="flex flex-wrap items-center gap-2">
             <input
               type="date"
               value={date}
-              onChange={(e) => { if (e.target.value) { restored.current = null; setDate(e.target.value); redo(); } }}
+              onChange={(e) => { if (e.target.value) { restored.current = null; setForceSunday(false); setDate(e.target.value); redo(); } }}
               aria-label="Dispatch date"
               className="cursor-pointer rounded-full border border-slate-200 bg-white px-3 py-1.5 dark:border-slate-700 dark:bg-slate-900"
             />
             <label className="flex items-center gap-2 rounded-full border border-slate-200 bg-white py-1 pl-3 pr-1 dark:border-slate-700 dark:bg-slate-900">
               <span className={mute}>Days of stock</span>
               <NumInput
-                value={days}
+                value={D}
                 step={0.5}
                 label="Days of stock"
-                onCommit={(v) => { setDays(Math.max(0.5, v || 2)); redo(); saveParamS("days", Math.max(0.5, v || 2)); if (date) writeJSON(planKey(date), clearedPlan()); }}
+                onCommit={(v) => { const x = Math.max(0.5, v || 2); saveSetting("days_of_stock", "daysOfStock", x); redo(); if (date) writeJSON(planKey(date), clearedPlan()); }}
                 w="w-14"
                 pill
               />
@@ -551,8 +1025,207 @@ export default function PlannerPage() {
             >
               Reset
             </button>
+            <button
+              onClick={() => setRulesOpen(true)}
+              aria-label="Settings"
+              title="Settings"
+              className="cursor-pointer rounded-full border border-slate-200 bg-white px-3 py-1.5 text-lg leading-none hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"
+            >
+              ⚙
+            </button>
           </div>
         </header>
+
+        {/* settings popup — opened from the header gear. Global values live in the
+            planner_settings + vehicles DB rows, per-outlet values in the outlets
+            table; every change applies to the plan instantly and saves to the DB */}
+        {rulesOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-900/40 p-4 sm:p-8"
+            onClick={() => setRulesOpen(false)}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Settings"
+              onClick={(e) => e.stopPropagation()}
+              className={`${card} w-full max-w-[760px]`}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={title}>Settings</span>
+                  <span className={mute}>
+                    {VEH == null || rules == null
+                      ? "database: loading…"
+                      : (vehInfo && !vehInfo.ok) || (rulesInfo && !rulesInfo.ok)
+                        ? "database unreachable — defaults in use (run supabase_migration_planner_v9.sql)"
+                        : "stored in the database (planner_settings + vehicles + outlets)"}
+                  </span>
+                  {rulesMsg && (
+                    <Badge t={rulesMsg.ok === false ? "red" : rulesMsg.ok ? "green" : "amber"}>{rulesMsg.text}</Badge>
+                  )}
+                </div>
+                <button
+                  onClick={() => setRulesOpen(false)}
+                  aria-label="Close"
+                  className="cursor-pointer rounded-full px-2 py-0.5 text-lg leading-none text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="mt-3 font-semibold">Dispatch rules</div>
+              <div className="mt-2 flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2">
+                  <span className={mute}>Radius (km)</span>
+                  <NumInput value={R.ecoRadiusKm} label="Radius km" onCommit={(v) => saveSetting("eco_radius_km", "ecoRadiusKm", Math.max(0.5, v || 5))} w="w-14" />
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className={mute}>Minimum tarts per outlet</span>
+                  <NumInput value={R.minTartsPerOutlet} label="Minimum tarts per outlet" onCommit={(v) => saveSetting("min_tarts_per_outlet", "minTartsPerOutlet", Math.max(0, Math.round(v) || 0))} w="w-16" />
+                </label>
+              </div>
+
+              <div className="mt-4 font-semibold">Vehicles</div>
+              <div className={`${mute} mt-1`}>
+                Name, capacity, fares and stop limits per vehicle — saved to the vehicles table. Tray vans count 60L-box slots; the freezer van counts cartons. The 3-wheeler is charged per drop; the freezer van&apos;s Pune fare is the two-drop total.
+              </div>
+              <div className="mt-2 overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr>
+                      <th className={th}>Vehicle</th>
+                      <th className={th}>Capacity</th>
+                      <th className={th}>Trip fare ₹</th>
+                      <th className={th}>Pune fare ₹</th>
+                      <th className={th}>Max stops</th>
+                      <th className={th}>Eco within / beyond radius</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {["es", "el", "ef", "pv"].map((k) => {
+                      const v = V(k);
+                      return (
+                        <tr key={k} className={row}>
+                          <td className={td}>
+                            <TextInput value={v.l} label={`${v.l} name`} onCommit={(s) => saveVehicle(k, "name", "l", s)} w="w-40" />
+                          </td>
+                          <td className={td}>
+                            <div className="flex items-center gap-1">
+                              <NumInput value={v.cap} label={`${v.l} capacity`} onCommit={(x) => saveVehicle(k, "box_capacity", "cap", Math.max(1, Math.round(x) || 1))} w="w-14" />
+                              <span className="whitespace-nowrap text-sm text-slate-400">{v.m == "c" ? "cartons" : "slots"}</span>
+                            </div>
+                          </td>
+                          <td className={td}>
+                            {k == "pv" ? (
+                              <span className={mute}>per drop</span>
+                            ) : (
+                              <NumInput value={v.flat} label={`${v.l} trip fare`} onCommit={(x) => saveVehicle(k, "flat_fare", "flat", Math.max(0, Math.round(x) || 0))} w="w-20" />
+                            )}
+                          </td>
+                          <td className={td}>
+                            {k == "ef" ? (
+                              <NumInput value={v.puneFlat} label={`${v.l} Pune fare`} onCommit={(x) => saveVehicle(k, "pune_flat_fare", "puneFlat", Math.max(0, Math.round(x) || 0))} w="w-20" />
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                          </td>
+                          <td className={td}>
+                            <NumInput value={v.maxStops} label={`${v.l} max stops`} onCommit={(x) => saveVehicle(k, "max_stops", "maxStops", Math.max(1, Math.round(x) || 1))} w="w-12" />
+                          </td>
+                          <td className={td}>
+                            {k == "es" ? (
+                              <div className="flex items-center gap-1">
+                                <NumInput value={v.maxNear} label="Eco max within radius" onCommit={(x) => saveVehicle(k, "max_near_stops", "maxNear", Math.max(0, Math.round(x) || 0))} w="w-12" />
+                                <span className="text-slate-400">/</span>
+                                <NumInput value={v.maxFar} label="Eco max beyond radius" onCommit={(x) => saveVehicle(k, "max_far_stops", "maxFar", Math.max(0, Math.round(x) || 0))} w="w-12" />
+                              </div>
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="mt-4 font-semibold">Dispatch settings</div>
+              <div className="mt-2 flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2">
+                  <span className={mute}>Shelf life (days of stock to send)</span>
+                  <NumInput value={R.shelfLifeDays} label="Shelf life days" onCommit={(v) => saveSetting("shelf_life_days", "shelfLifeDays", Math.max(1, v || 30))} w="w-16" />
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className={mute}>Kitchen storage limit</span>
+                  <NumInput value={R.cksLimit} label="Kitchen storage limit" onCommit={(v) => saveSetting("cks_limit", "cksLimit", Math.max(0, Math.round(v) || 4000))} w="w-20" />
+                </label>
+              </div>
+
+              <div className="mt-4 font-semibold">Packaging</div>
+              <div className={`${mute} mt-1`}>
+                Prices the packing lists — cartons for the freezer van, dry ice (kg, by trip distance) for the tray vans, and the trays-per-carton that sizes the freezer van&apos;s capacity (32 trays × 6 tarts = 192 per carton). Saved to planner_settings.
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2">
+                  <span className={mute}>Carton ₹ / carton</span>
+                  <NumInput value={R.cartonRs} label="Carton cost" onCommit={(v) => saveSetting("carton_rs", "cartonRs", Math.max(0, Math.round(v) || 0))} w="w-16" />
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className={mute}>Dry ice ₹ / kg</span>
+                  <NumInput value={R.dryIceRsPerKg} label="Dry ice cost per kg" onCommit={(v) => saveSetting("dry_ice_rs_per_kg", "dryIceRsPerKg", Math.max(0, Math.round(v) || 0))} w="w-16" />
+                </label>
+                <label className="flex items-center gap-2">
+                  <span className={mute}>Trays per carton</span>
+                  <NumInput value={R.traysPerCarton} label="Trays per carton" onCommit={(v) => saveSetting("trays_per_carton", "traysPerCarton", Math.max(1, Math.round(v) || 32))} w="w-14" />
+                </label>
+              </div>
+
+              <div className="mt-4 font-semibold">Outlets</div>
+              <div className={`${mute} mt-1`}>
+                Weekday avg sales / weekend daily avg sales / freezer capacity / min &amp; max send per outlet — saved to the outlets table (empty = the global rules apply; a typed 0 is a real zero: max 0 sends nothing, min 0 is no forced minimum). The company name and FSSAI number on the delivery challans come from the brands table.
+              </div>
+              {ids == null ? (
+                <div className={`${mute} mt-2`}>loading the outlets table…</div>
+              ) : (
+                <div className="mt-2 max-h-80 overflow-y-auto rounded-xl border border-slate-100 dark:border-slate-800">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr>
+                        <th className={th}>Outlet</th>
+                        <th className={th}>Weekday avg sales</th>
+                        <th className={th}>Weekend daily avg</th>
+                        <th className={th}>Freezer capacity</th>
+                        <th className={th}>Min send</th>
+                        <th className={th}>Max send</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {N.map((n, o) => (
+                        <tr key={n} className={row}>
+                          <td className={`${td} whitespace-nowrap font-medium`}>
+                            {n}
+                            {ids[o] == null && <Badge t="amber">no DB row</Badge>}
+                          </td>
+                          <td className={td}><NumInput value={WD?.[o] ?? 0} label={`${n} weekday avg sales`} onCommit={(v) => saveOutlet(o, "weekday_avg", "wd", v)} w="w-16" /></td>
+                          <td className={td}><NumInput value={WE?.[o] ?? 0} label={`${n} weekend daily avg sales`} onCommit={(v) => saveOutlet(o, "weekend_avg", "we", v)} w="w-16" /></td>
+                          <td className={td}><NumInput value={capw?.[o] ?? 0} label={`${n} freezer capacity`} onCommit={(v) => saveOutlet(o, "fridge_capacity", "capw", v)} w="w-20" /></td>
+                          <td className={td}><OptNumInput value={mins?.[o] ?? null} label={`${n} min send quantity`} onCommit={(v) => saveOutlet(o, "min_send_qty", "mins", v == null ? null : Math.round(v))} w="w-16" /></td>
+                          <td className={td}><OptNumInput value={maxs?.[o] ?? null} label={`${n} max send quantity`} onCommit={(v) => saveOutlet(o, "max_send_qty", "maxs", v == null ? null : Math.round(v))} w="w-16" /></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div className={`${mute} mt-2`}>
+                Private 3-wheeler: 1–{V("pv").maxStops} stops. Eco (small van): at most {V("es").maxNear} stops within {R.ecoRadiusKm} km of the kitchen + {V("es").maxFar} beyond, {V("es").maxStops} total — on a full mixed load it drops the near stops first and comes back to the kitchen before the far run. Large van and freezer van: up to {V("el").maxStops}/{V("ef").maxStops} stops anywhere in Mumbai; when the load outgrows one van the planner switches to the next bigger one automatically, and a trip nothing can carry is flagged in red. Minimum tarts: an outlet the planner picks itself always receives at least this much when the freezer has room — typed manual numbers always win; a typed 0 is a real zero (min 0 = no forced minimum for that outlet). Shelf life caps how much an outlet gets in one go (sales over N days — the product lasts 30 days from manufacturing, made the day before dispatch); the challans show the expiry (30 days from manufacturing). Every change applies to the plan immediately and saves to the database, so it holds on every device.
+              </div>
+            </div>
+          </div>
+        )}
 
         {!configOk ? (
           configInfo == null ? (
@@ -561,7 +1234,7 @@ export default function PlannerPage() {
             <div className={card}>
               <div className="font-semibold text-rose-600">Outlet setup incomplete</div>
               <div className={`${mute} mt-1`}>
-                The planner takes coordinates and freezer capacity only from the outlets table — fill in the missing values there, then retry.
+                The planner takes coordinates, freezer capacity and the sales averages only from the outlets table — fill in the missing values there (or in the ⚙ popup), then retry.
                 <div className="mt-1">
                   {cfg ? (
                     <>
@@ -570,6 +1243,7 @@ export default function PlannerPage() {
                       {cfg.missingRows.length > 0 && <div>no active row in the table for: {cfg.missingRows.join(", ")}</div>}
                       {cfg.missingCoords.length > 0 && <div>no coordinates for: {cfg.missingCoords.join(", ")}</div>}
                       {cfg.missingCap.length > 0 && <div>no freezer capacity for: {cfg.missingCap.join(", ")}</div>}
+                      {cfg.missingSales.length > 0 && <div>no weekday/weekend sales for: {cfg.missingSales.join(", ")}</div>}
                       {!cfg.kit && <div>no coordinates for the kitchen row (CK)</div>}
                     </>
                   ) : (
@@ -585,10 +1259,53 @@ export default function PlannerPage() {
               </button>
             </div>
           )
+        ) : sunday && !forceSunday ? (
+          /* Sunday: the kitchen is closed (spec section 13). Show Monday's plan and let
+             the owner force an emergency dispatch with today's date. */
+          <div className="flex flex-col gap-3">
+            <div className={card}>
+              <div className="font-semibold text-rose-600">Sunday — kitchen closed</div>
+              <div className={`${mute} mt-1`}>
+                Monday&apos;s plan is ready below ({dateLabel(effD)} dispatch). No dispatch happens today unless you press the emergency button — the delivery challans would then carry today&apos;s date.
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                {sunPreview.length == 0 ? (
+                  <span className={mute}>Nothing critical on Monday — no dispatch needed.</span>
+                ) : (
+                  <>
+                    <span className={mute}>Monday needs:</span>
+                    {sunPreview.map((x) => (
+                      <Badge key={x.o} t="amber">⚡ {N[x.o]} · {x.reason}</Badge>
+                    ))}
+                  </>
+                )}
+              </div>
+              <button
+                onClick={() => setForceSunday(true)}
+                className="mt-3 cursor-pointer rounded-full bg-rose-600 px-4 py-1.5 font-medium text-white hover:bg-rose-500"
+              >
+                Dispatch today anyway (emergency)
+              </button>
+            </div>
+            <div className={`${card} ${mute}`}>The full Monday plan appears here after you force the dispatch.</div>
+          </div>
         ) : !view ? (
-          <div className={`${card} text-center font-medium text-rose-600`}>Sunday: kitchen closed. Pick another date.</div>
+          <div className={`${card} text-center font-medium text-rose-600`}>Plan unavailable — reload the page.</div>
         ) : (
           <>
+            {view.trips.length == 0 && (
+              /* "No dispatch today" (spec section 13). When outlets are selected but the
+                 kitchen couldn't fill them, the message says so instead. */
+              <div className={`${card} mb-3 border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-300`}>
+                <div className="font-semibold">{SEL.length > 0 ? "Nothing to load today" : "No dispatch today"}</div>
+                <div className={`mt-1 ${mute}`}>
+                  {SEL.length > 0
+                    ? "Outlets are selected but the kitchen couldn't fill them (see the Kitchen card below). No vehicle is sent without at least one real drop."
+                    : `Nothing is critical under ${D} days of stock. Pick outlets by hand below, or adjust “Days of stock”, “Shelf life” or the sales numbers in the ⚙ popup.`}
+                </div>
+              </div>
+            )}
+
             {/* grid: cost + options share the top row on wide screens, everything
                 else spans both columns one by one (order-* sets the sequence) */}
             <div className={`grid gap-3 lg:gap-x-5 ${OPTS.length > 0 ? "lg:grid-cols-2" : ""}`}>
@@ -597,58 +1314,151 @@ export default function PlannerPage() {
                 {/* outlets */}
                 <section className={`${card} order-4 lg:col-span-2`}>
                   <div className="mb-2 flex items-center justify-between">
-                    <h2 className={title}>Outlets</h2>
-                    <span className={mute}>⚡ under {days} days</span>
+                    <h2 className={title}>Outlets{sunday && forceSunday ? " · Monday plan (emergency)" : ""}</h2>
+                    <span className={mute}>⚡ under {D} days</span>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {N.map((n, o) => {
-                      const cv = cover(ctx, o, d, st[o]);
-                      const crit = cv < days;
+                      const info = view.P.info[o];
+                      const cv = info ? info.cover : null;
+                      const crit = info ? info.critical : false;
                       const on = SEL.includes(o);
+                      const deferred = (view.P.deferred || []).some((x) => x.o === o);
                       return (
                         <button
                           key={o}
                           onClick={() => toggleOutlet(o)}
+                          title={info ? info.reason : ""}
                           className={`flex cursor-pointer items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm font-medium transition ${
                             on
                               ? "border-slate-900 bg-slate-900 text-white dark:border-white dark:bg-white dark:text-slate-900"
                               : "border-slate-200 bg-white hover:border-slate-400 dark:border-slate-700 dark:bg-slate-900"
                           }`}
                         >
-                          <span className={`h-1.5 w-1.5 rounded-full ${crit ? "bg-rose-500" : cv < days + 1 ? "bg-amber-400" : "bg-emerald-500"}`} />
+                          <span className={`h-1.5 w-1.5 rounded-full ${crit ? "bg-rose-500" : cv != null && cv < D + 1 ? "bg-amber-400" : "bg-emerald-500"}`} />
                           {crit && "⚡"}
                           {n}
-                          <span className="tabular-nums opacity-60">{st[o]} · {cv.toFixed(1)}d</span>
+                          <span className="tabular-nums opacity-60">
+                            {effSt[o]} · {cv == null || cv === Infinity ? "–" : cv.toFixed(1) + "d"}
+                          </span>
+                          {deferred && <Badge t="amber">waits</Badge>}
                         </button>
                       );
                     })}
                   </div>
+                  {(view.P.deferred || []).length > 0 && (
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      {view.P.deferred.map((x) => (
+                        <Badge key={x.o} t="amber">⏸ {N[x.o]}: {x.reason}</Badge>
+                      ))}
+                    </div>
+                  )}
+                  {view.chosenIds.length > 0 && view.tmCritical.length > 0 && (
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      <span className={mute}>Tomorrow after this dispatch:</span>
+                      {view.tmCritical.map((x) => (
+                        <Badge key={x.o} t="red">⚡ {N[x.o]} · {x.reason}</Badge>
+                      ))}
+                    </div>
+                  )}
                 </section>
 
                 {/* vehicles and boxes */}
                 <section className="order-5 flex flex-col gap-3 lg:col-span-2">
                   <div className="flex items-center justify-between px-1">
                     <h2 className={title}>Vehicles</h2>
-                    {view.trips.length > 0 && (
+                    <div className="flex items-center gap-2">
                       <button
-                        onClick={() => copyList("all", allTripsCopyText(view, d))}
-                        className="cursor-pointer rounded-full border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"
+                        onClick={() => setNewTrip((o) => (o ? null : { vk: null, ids: [] }))}
+                        className="cursor-pointer rounded-full bg-slate-900 px-3 py-1.5 text-sm font-semibold text-white hover:bg-slate-700 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200"
                       >
-                        {copied === "all" ? "Copied ✓" : "Copy all lists"}
+                        {newTrip ? "Close" : "+ Add trip"}
                       </button>
-                    )}
+                      {view.trips.length > 0 && (
+                        <button
+                          onClick={() => copyList("all", allTripsCopyText(ctx, view, d))}
+                          className="cursor-pointer rounded-full border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"
+                        >
+                          {copied === "all" ? "Copied ✓" : "Copy all lists"}
+                        </button>
+                      )}
+                    </div>
                   </div>
+                  {newTrip && (
+                    <div className={card}>
+                      <div className="font-semibold">Add a trip</div>
+                      <div className={`${mute} mt-1`}>
+                        Send an extra run with a vehicle of your choice: pick the vehicle and the outlets. Their planned quantities move onto this run (and off the auto plan) — a fresh allocation rules the amount, still editable in each outlet&apos;s quantities fold.
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                        {["es", "el", "ef", "pv"].map((k) => (
+                          <button
+                            key={k}
+                            onClick={() => setNewTrip((n) => ({ ...n, vk: k }))}
+                            className={`cursor-pointer rounded-full border px-3 py-1.5 text-sm font-medium ${newTrip.vk == k ? "border-slate-900 bg-slate-900 text-white dark:border-white dark:bg-white dark:text-slate-900" : "border-slate-200 bg-white hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"}`}
+                          >
+                            {V(k).l}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                        {N.map((name, o) => {
+                          const on = newTrip.ids.includes(o);
+                          const taken = !on && EXTRAS.some((e) => (e.ids || []).includes(o));
+                          return (
+                            <button
+                              key={o}
+                              disabled={taken}
+                              onClick={() => setNewTrip((n) => ({ ...n, ids: on ? n.ids.filter((x) => x != o) : n.ids.concat(o) }))}
+                              className={`cursor-pointer rounded-full border px-3 py-1.5 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 ${on ? "border-slate-900 bg-slate-900 text-white dark:border-white dark:bg-white dark:text-slate-900" : "border-slate-200 bg-white hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"}`}
+                            >
+                              {name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="mt-3 flex justify-end gap-2">
+                        <button
+                          onClick={() => setNewTrip(null)}
+                          className="cursor-pointer rounded-full border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={addExtra}
+                          disabled={!newTrip.vk || newTrip.ids.length == 0}
+                          className="cursor-pointer rounded-full bg-slate-900 px-4 py-1.5 text-sm font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200"
+                        >
+                          Add trip
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   {view.trips.length == 0 && <div className={`${card} ${mute}`}>No outlet selected.</div>}
-                  {view.trips.map(({ t, c, over, km }, ti) => (
+                  {view.trips.map(({ t, c, stops, km, mins, U, over }, ti) => (
                     <div key={t.key} className={card} style={{ borderLeft: `4px solid ${COL[ti % 4]}` }}>
                       <div className="flex items-start justify-between gap-2">
                         <div>
-                          <div className="font-semibold">Trip {ti + 1}</div>
-                          <div className={mute}>{t.ids.map((o) => N[o]).join(" → ")}</div>
+                          <div className="font-semibold">
+                            Trip {ti + 1}
+                            {t.manual && <Badge t="green">manual run</Badge>}
+                            {c.returnRun && <Badge t="amber">return run — 2 legs, 1 fare</Badge>}
+                            {t.kind == "pune" && <Badge t="amber">Pune</Badge>}
+                            {t.noFit && <Badge t="red">load over the biggest van — reduce quantities or split</Badge>}
+                          </div>
+                          <div className={mute}>
+                            {c.returnRun
+                              ? c.runs.map((r) => r.ids.map((o) => N[o]).join(" → ")).join("   ⟲   ")
+                              : "Kitchen → " + t.ids.map((o) => N[o]).join(" → ")}
+                          </div>
                         </div>
                         <div className="text-right">
-                          <div className="font-semibold tabular-nums">{t.U} tarts</div>
-                          <div className={mute}>{Math.round(km)} km{Z[t.ids[0]] == "P" ? " · Pune" : ""}</div>
+                          <div className="font-semibold tabular-nums">{U} tarts</div>
+                          <div className={mute}>
+                            {Math.round(km)} km · ~{Math.round(mins)} min
+                            {c.returnRun ? " · both legs" : ""}
+                            {t.kind == "pune" ? " · Pune" : ""}
+                          </div>
                         </div>
                       </div>
 
@@ -656,6 +1466,7 @@ export default function PlannerPage() {
                         options={t.o}
                         value={c.k}
                         onChange={(k) => {
+                          if (t.manual) { setExtraVeh(Number(String(t.key).slice(1)), k); return; }
                           const nS = { ...SELV, [t.key]: k };
                           setSELV(nS);
                           savePlan({ SELV: nS });
@@ -668,24 +1479,59 @@ export default function PlannerPage() {
                           {c.used}/{c.cap} {c.m == "c" ? "cartons" : "slots"}
                         </span>
                         {over > 0 && <Badge t="red">−{over}</Badge>}
-                        {c.k != "pv" && t.ids.length < 4 && <Badge t="amber">under 4 stops</Badge>}
+                        {c.k != "pv" && !c.returnRun && stops.length < 4 && <Badge t="amber">under 4 stops</Badge>}
+                        {c.perDrop && stops.length > 5 && <Badge t="amber">{stops.length} drops — usually 4-5</Badge>}
+                        {t.manual && (
+                          <button
+                            onClick={() => removeExtra(Number(String(t.key).slice(1)))}
+                            className="cursor-pointer whitespace-nowrap rounded-full border border-rose-200 bg-white px-3 py-1.5 text-sm font-medium text-rose-600 hover:bg-rose-50 dark:border-rose-900 dark:bg-slate-900 dark:text-rose-300 dark:hover:bg-rose-950"
+                          >
+                            Remove trip
+                          </button>
+                        )}
                         <button
-                          onClick={() => copyList(ti, tripCopyText(ti, t, c, km, view.P, d))}
+                          onClick={() => copyList(ti, tripCopyText(ctx, ti, t, c, km, view.P, d))}
                           className="ml-auto cursor-pointer whitespace-nowrap rounded-full border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"
                         >
                           {copied === ti ? "Copied ✓" : "Copy packing list"}
                         </button>
                       </div>
 
+                      {c.returnRun && (
+                        /* the two legs of a return run: near drops first, back to the
+                           kitchen to reload, then the far run on the same flat fare */
+                        <div className="mt-2 overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <thead><tr><th className={th}>Leg</th><th className={th}>Stops</th><th className={th}>Tarts</th><th className={th}>Boxes</th></tr></thead>
+                            <tbody>
+                              {c.runs.map((r, ri) => (
+                                <tr key={ri} className={row}>
+                                  <td className={td}>{r.label}</td>
+                                  <td className={td}>{r.ids.map((o) => N[o]).join(" → ")}</td>
+                                  <td className={`${td} tabular-nums`}>{r.U}</td>
+                                  <td className={`${td} tabular-nums`}>{r.used}/{c.cap} slots</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+
                       <div className="mt-2">
-                        {t.ids.map((o, i) => {
-                          const bx = c.bx[i];
+                        {stops.map((o, i) => {
+                          const bx = c.returnRun
+                            ? c.runs.map((r) => r.bx).flat()[i]
+                            : c.bx[i];
+                          const auto = !!c.returnRun;
                           return (
                             <div key={o} className={`${row} flex flex-wrap items-center justify-between gap-2 py-1.5`}>
                               <div>
-                                <div className="font-medium">{N[o]}</div>
+                                <div className="font-medium">
+                                  {N[o]}
+                                  {auto && <span className={`${mute} font-normal`}> · auto</span>}
+                                </div>
                                 <div className={mute}>
-                                  {view.P.u[o]} tarts · holds {bcap(bx)}{c.m == "t" ? ` · ${dry(o, bx).toFixed(1)} kg ice` : ""}
+                                  {view.P.u[o] || 0} tarts · holds {bcap(bx)}{c.m == "t" ? ` · ${dry(ctx, o, bx).toFixed(1)} kg ice` : ""}
                                 </div>
                               </div>
                               <div className="flex items-center gap-1 text-sm text-slate-500">
@@ -694,6 +1540,8 @@ export default function PlannerPage() {
                                     <NumInput value={bx.c} label={`${N[o]} cartons`} onCommit={(v) => editBoxes(o, { m: "c", c: v })} w="w-14" />
                                     cartons
                                   </>
+                                ) : auto ? (
+                                  <span className="tabular-nums">{bx.a} × 60L + {bx.b} × 30L</span>
                                 ) : (
                                   <>
                                     <NumInput value={bx.a} label={`${N[o]} 60L boxes`} onCommit={(v) => editBoxes(o, { m: "t", a: v, b: bx.b })} w="w-12" />
@@ -713,20 +1561,55 @@ export default function PlannerPage() {
                           {fm(c.veh)} + {c.m == "c" ? "cartons" : "ice"} {fm(c.pk)}
                         </span>
                         <span className="font-semibold tabular-nums">
-                          {fm(c.c)} <span className="font-normal text-slate-500">· {cpt(c.c / t.U)}/tart</span>
+                          {fm(c.c)} <span className="font-normal text-slate-500">· {cpt(U ? c.c / U : NaN)}/tart</span>
                         </span>
                       </div>
                     </div>
                   ))}
                 </section>
 
+                {/* send PO + challans */}
+                <section className="order-6 lg:col-span-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-slate-900 p-3 text-white shadow-sm dark:bg-slate-800">
+                    <div>
+                      <div className="font-semibold">Send PO</div>
+                      <div className="text-sm text-slate-400">
+                        Saves the plan to dispatch history, then prints one delivery challan per outlet
+                        {sunday && forceSunday ? " (dated TODAY — emergency)" : ""}.
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={downloadChallans}
+                        disabled={view.trips.length == 0}
+                        className="cursor-pointer rounded-full border border-white/30 px-3 py-1.5 text-sm font-medium hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Challans only
+                      </button>
+                      <button
+                        onClick={sendPo}
+                        disabled={sending || view.trips.length == 0}
+                        className="cursor-pointer rounded-full bg-emerald-500 px-4 py-1.5 text-sm font-semibold text-white hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {sending ? "Sending…" : "Send PO"}
+                      </button>
+                    </div>
+                  </div>
+                  {sendMsg && (
+                    <div className={`mt-2 text-sm font-medium ${sendMsg.ok ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                      {sendMsg.text}
+                    </div>
+                  )}
+                </section>
+
                 {/* quantities and stock */}
-                <section className="order-6 flex flex-col gap-3 lg:col-span-2">
+                <section className="order-7 flex flex-col gap-3 lg:col-span-2">
                   <h2 className={`${title} px-1`}>Quantities</h2>
                   {SEL.length == 0 && <div className={`${card} ${mute}`}>No outlet selected.</div>}
                   {SEL.map((o) => {
-                    const U = view.P.u[o], after = st[o] + U, rm = capw[o] - after;
-                    const cv = cover(ctx, o, d, st[o]);
+                    const U = view.P.u[o] || 0, after = effSt[o] + U, rm = (capw[o] || 0) - after;
+                    const info = view.P.info[o];
+                    const cv = info ? info.cover : NaN;
                     return (
                       <Fold
                         key={o}
@@ -739,7 +1622,8 @@ export default function PlannerPage() {
                               <span className="tabular-nums">{U} <span className={mute}>({U / 6} trays)</span></span>
                               {rm < 0 && <Badge t="red">−{-rm} over</Badge>}
                               {Z[o] == "P" && after > 918 && rm >= 0 && <Badge t="amber">above 918</Badge>}
-                              {U < r6(capw[o] - st[o]) && <Badge t="amber">partial fill</Badge>}
+                              {U < r6((capw[o] || 0) - effSt[o]) && <Badge t="amber">partial fill</Badge>}
+                              {info && info.low.length > 0 && <Badge t="amber">{info.low.length} low flavour{info.low.length == 1 ? "" : "s"}</Badge>}
                             </div>
                             <div className="mt-1.5 flex items-center gap-2">
                               <Bar value={after} max={capw[o]} over={rm < 0} />
@@ -753,7 +1637,9 @@ export default function PlannerPage() {
                             <span className={mute}>Total</span>
                             <NumInput value={U} step={6} label={`${N[o]} total tarts`} onCommit={(v) => editTotal(o, v)} w="w-20" />
                           </label>
-                          <span className={mute}>{cv.toFixed(1)} days left · {WD[o]}/day · {WE[o]} weekends</span>
+                          <span className={mute}>
+                            {info ? info.reason : `${isNaN(cv) ? "–" : cv.toFixed(1)} days left`} · {WD[o]}/day · {WE[o]} weekends
+                          </span>
                         </div>
 
                         <div className="overflow-x-auto">
@@ -765,7 +1651,7 @@ export default function PlannerPage() {
                                   <tr key={f[0]} className={row}>
                                     <td className={td}>{f[0]}</td>
                                     <td className={td}><NumInput value={S[o][i]} label={`${f[0]} stock`} onCommit={(v) => editStock(o, i, v)} /></td>
-                                    <td className={td}><NumInput value={view.P.q[o][i]} step={6} label={`${f[0]} send`} onCommit={(v) => editFlavour(o, i, v)} /></td>
+                                    <td className={td}><NumInput value={(view.P.q[o] || [])[i] || 0} step={6} label={`${f[0]} send`} onCommit={(v) => editFlavour(o, i, v)} /></td>
                                   </tr>
                                 )
                               )}
@@ -875,7 +1761,7 @@ export default function PlannerPage() {
                         </span>
                         <span className="tabular-nums">{view.ckT} in stock</span>
                         <span className={mute}>sending {view.sT}</span>
-                        {view.short > 0 ? <Badge t="red">short {view.short}</Badge> : <Badge t="green">{view.left} left</Badge>}
+                        <Badge t={view.left < 0 ? "red" : "green"}>{view.left} left</Badge>
                       </div>
                     }
                   >
@@ -904,16 +1790,20 @@ export default function PlannerPage() {
                 </div>
 
                 {/* map */}
-                <section className={`${card} order-7 lg:col-span-2`}>
+                <section className={`${card} order-8 lg:col-span-2`}>
                   <h2 className={`${title} mb-2`}>Route</h2>
-                  <RouteMap trips={view.P.trips.map((t) => ({ ids: t.ids }))} ll={LLS} kit={KITP} />
+                  <RouteMap
+                    trips={view.trips.map(({ stops }) => ({ ids: stops }))}
+                    ll={LLS}
+                    kit={KITP}
+                  />
                 </section>
               </aside>
             </div>
 
             {/* week plan */}
             <section className={`${card} mt-5`}>
-              <h2 className={`${title} mb-2`}>Next 6 working days</h2>
+              <h2 className={`${title} mb-2`}>Next 6 working days{sunday ? " (from Monday)" : ""}</h2>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -927,7 +1817,7 @@ export default function PlannerPage() {
                         <td className={td}><NumInput value={r.prod} label={`Production day ${i + 1}`} onCommit={(v) => { set1d(setPROD, i, v); saveParam("prod", i, v); }} /></td>
                         <td className={td}>{r.ids.map((o) => N[o]).join(", ") || "–"}</td>
                         <td className={`${td} tabular-nums`}>{r.ship}</td>
-                        <td className={`${td} tabular-nums ${r.close < 0 || r.close > CKS ? "font-semibold text-rose-600" : ""}`}>{Math.round(r.close)}</td>
+                        <td className={`${td} tabular-nums ${r.close < 0 || r.close > R.cksLimit ? "font-semibold text-rose-600" : ""}`}>{Math.round(r.close)}</td>
                         <td className={`${td} whitespace-nowrap`}>{r.svc}</td>
                         <td className={`${td} tabular-nums`}>{r.cpt == null ? "–" : cpt(r.cpt)}</td>
                       </tr>
@@ -939,54 +1829,40 @@ export default function PlannerPage() {
 
             {/* data */}
             <section className="mt-3 flex flex-col gap-3">
-              <Fold head={<span className={title}>Sales and freezer capacity</span>}>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead><tr><th className={th}>Outlet</th><th className={th}>Weekday</th><th className={th}>Weekend</th><th className={th}>Freezer</th></tr></thead>
-                    <tbody>
-                      {N.map((n, o) => (
-                        <tr key={n} className={row}>
-                          <td className={td}>{n}</td>
-                          <td className={td}><NumInput value={WD[o]} label={`${n} weekday sales`} onCommit={(v) => { set1d(setWD, o, v); redo(); saveParam("wd", o, v); if (date) writeJSON(planKey(date), clearedPlan()); }} /></td>
-                          <td className={td}><NumInput value={WE[o]} label={`${n} weekend sales`} onCommit={(v) => { set1d(setWE, o, v); redo(); saveParam("we", o, v); if (date) writeJSON(planKey(date), clearedPlan()); }} /></td>
-                          <td className={td}><NumInput value={capw[o]} label={`${n} freezer capacity`} onCommit={(v) => { set1d(setCapw, o, v); redo(); saveParam("capw", o, v); if (date) writeJSON(planKey(date), clearedPlan()); }} w="w-20" /></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <label className="mt-3 flex items-center gap-2">
-                  <span className={mute}>Kitchen storage limit</span>
-                  <NumInput value={CKS} label="Kitchen storage limit" onCommit={(v) => { setCKS(v); saveParamS("CKS", v); }} w="w-20" />
-                </label>
-              </Fold>
-
               <Fold
                 head={
                   <div className="flex flex-wrap items-center gap-2">
                     <span className={title}>Stock of every outlet</span>
                     <span className={mute}>
-                      {sheetInfo == null
-                        ? "sheet: loading…"
-                        : sheetInfo.ok
-                          ? `sheet ${sheetInfo.date || "(no date)"}`
-                          : "sheet failed — manual values"}
+                      {stockInfo == null
+                        ? "closing stock: loading…"
+                        : stockInfo.ok
+                          ? "from the outlet team's closing-stock entries"
+                          : "couldn't read stock"}
                     </span>
-                    {sheetInfo?.ok && sheetInfo.missing.length > 0 && (
-                      <Badge t="amber">no sheet data: {sheetInfo.missing.length}</Badge>
+                    {stockInfo?.ok && stockInfo.sheet.used.length > 0 && (
+                      <Badge t="amber">sheet fallback: {stockInfo.sheet.used.join(", ")}</Badge>
                     )}
-                    {sheetInfo?.ok && sheetInfo.manual.length > 0 && (
-                      <Badge t="amber">manual stock: {sheetInfo.manual.length}</Badge>
+                    {stockInfo?.ok && stockInfo.missing.length > 0 && (
+                      <Badge t="amber">no entries: {stockInfo.missing.length}</Badge>
+                    )}
+                    {stockInfo?.ok && stockInfo.unknownItems.length > 0 && (
+                      <Badge t="amber">unmatched items: {stockInfo.unknownItems.length}</Badge>
                     )}
                   </div>
                 }
               >
-                {sheetInfo?.ok && (sheetInfo.missing.length > 0 || sheetInfo.manual.length > 0 || sheetInfo.unknownOutlets.length > 0 || sheetInfo.unknownItems.length > 0) && (
+                {stockInfo != null && !stockInfo.ok && (
                   <div className={`${mute} mb-2`}>
-                    {sheetInfo.missing.length > 0 && <div>no stock rows in sheet: {sheetInfo.missing.join(", ")}</div>}
-                    {sheetInfo.manual.length > 0 && <div>hardcoded stock (not reporting in sheet yet): {sheetInfo.manual.join(", ")}</div>}
-                    {sheetInfo.unknownOutlets.length > 0 && <div>in sheet but not in planner: {sheetInfo.unknownOutlets.join(", ")}</div>}
-                    {sheetInfo.unknownItems.length > 0 && <div>stock items not matched to a planner flavour: {sheetInfo.unknownItems.join(", ")}</div>}
+                    couldn&apos;t read stores_closing_stock{stockInfo.error ? ": " + stockInfo.error : ""} — run supabase_migration_planner_v8.sql in Supabase, then reload. The outlet team enters closing stock on the <a href="/shipment-planning/closing-stock" className="underline">Outlet Closing Stock</a> page.
+                  </div>
+                )}
+                {stockInfo?.ok && (stockInfo.missing.length > 0 || stockInfo.sheet.used.length > 0 || stockInfo.unknownItems.length > 0 || stockInfo.sheet.error) && (
+                  <div className={`${mute} mb-2`}>
+                    {stockInfo.missing.length > 0 && <div>no closing-stock entries (shown as 0): {stockInfo.missing.join(", ")}</div>}
+                    {stockInfo.sheet.used.length > 0 && <div>no entries yet — from the shared stock sheet ({stockInfo.sheet.date || "no date"}): {stockInfo.sheet.used.join(", ")}</div>}
+                    {stockInfo.unknownItems.length > 0 && <div>entered but not matched to a planner flavour: {stockInfo.unknownItems.join(", ")}</div>}
+                    {stockInfo.sheet.error && <div>sheet fallback failed: {stockInfo.sheet.error}</div>}
                   </div>
                 )}
                 <div className="overflow-x-auto">
@@ -994,7 +1870,22 @@ export default function PlannerPage() {
                     <thead>
                       <tr>
                         <th className={th}>Product</th>
-                        {N.map((n) => <th key={n} className={`${th} whitespace-nowrap`}>{n}</th>)}
+                        {N.map((n, o) => (
+                          <th key={n} className={`${th} whitespace-nowrap`}>
+                            {n}
+                            <div className="font-normal">
+                              {stockInfo == null
+                                ? "…"
+                                : stockInfo.ok
+                                  ? stockInfo.closing[o] != null
+                                    ? `closing ${stockInfo.closing[o]}`
+                                    : stockInfo.sheet.used.includes(N[o])
+                                      ? "from sheet"
+                                      : "no entry"
+                                  : "—"}
+                            </div>
+                          </th>
+                        ))}
                         <th className={th}>Total</th>
                       </tr>
                     </thead>
@@ -1012,6 +1903,9 @@ export default function PlannerPage() {
                       ))}
                     </tbody>
                   </table>
+                </div>
+                <div className={`${mute} mt-2`}>
+                  The numbers are the outlet team&apos;s daily closing-stock entries (newest at or before the dispatch date — entered on the <a href="/shipment-planning/closing-stock" className="underline">Outlet Closing Stock</a> page; outlets without entries fall back to the shared stock sheet). Typed cells are manual corrections.
                 </div>
               </Fold>
             </section>

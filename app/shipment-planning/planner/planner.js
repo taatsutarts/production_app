@@ -57,7 +57,7 @@ export const hv = (a, b) => 111 * Math.hypot(a[0] - b[0], (a[1] - b[1]) * 0.95) 
 // lowercase, punctuation -> space (for matching planner outlet names to the DB)
 const normName = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
 
-// Build the planner's coordinate/capacity config from rows of the Supabase `outlets`
+// Build the planner's config from rows of the Supabase `outlets`
 // table (outletConfig.js fetches them). The table is the single source — there are no
 // built-in fallback values, so every entry the table doesn't provide comes back null
 // and the page blocks the plan with a clear message (see page.jsx).
@@ -66,17 +66,29 @@ const normName = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").repl
 //   ll             [lat,lng] per outlet index in N, or null where the table has none
 //   capw           freezer capacity per outlet (fridge_capacity), or null where missing
 //   kit            kitchen (Tardeo) [lat,lng] from the row named "CK", or null
+//   zones          zone letter (C/W/E/P) per outlet, or null where missing
+//   cities         "Mumbai"/"Pune" per outlet, or null
+//   wd / we        real weekday_avg / weekend_avg sales per outlet, or null
+//   mins / maxs    per-outlet send limits (outlets.min_send_qty/max_send_qty), or null = off
+//   addr           full address per outlet (delivery challans), or null
+//   ids            DB row id per outlet (links plans back to the outlets table), or null
+//   near           1 for the near-kitchen outlets (spec §2: Gamdevi, Worli, Matunga, Bandra)
 //   tableRows      how many rows came back (0 = empty table / nothing active)
 //   dbOutlets      how many planner outlets matched a DB row
 //   missingRows    planner outlets with no active row in the table
 //   missingCoords  matched rows without latitude/longitude
 //   missingCap     matched rows without fridge_capacity
+//   missingSales   matched rows without weekday/weekend averages
 //   colsMissing    true when the table has no latitude column yet (pre-migration)
 export function mapConfig(rows) {
   const res = {
     ll: N.map(() => null), capw: N.map(() => null), kit: null,
+    zones: N.map(() => null), cities: N.map(() => null),
+    wd: N.map(() => null), we: N.map(() => null), addr: N.map(() => null),
+    mins: N.map(() => null), maxs: N.map(() => null),
+    ids: N.map(() => null), near: N.map(() => 0), poc: N.map(() => null),
     tableRows: Array.isArray(rows) ? rows.length : 0,
-    dbOutlets: 0, missingRows: [], missingCoords: [], missingCap: [],
+    dbOutlets: 0, missingRows: [], missingCoords: [], missingCap: [], missingSales: [],
     colsMissing: false,
   };
   if (!Array.isArray(rows) || rows.length == 0) return res;
@@ -106,6 +118,21 @@ export function mapConfig(rows) {
     else res.missingCoords.push(name);
     if (r.fridge_capacity != null && isFinite(r.fridge_capacity)) res.capw[o] = r.fridge_capacity;
     else res.missingCap.push(name);
+    res.zones[o] = r.zone || null;
+    res.cities[o] = r.city || null;
+    res.addr[o] = r.address || null;
+    res.ids[o] = r.id ?? null;
+    res.poc[o] = r.poc_contact || null;
+    if (r.weekday_avg != null && isFinite(Number(r.weekday_avg))) res.wd[o] = Number(r.weekday_avg);
+    if (r.weekend_avg != null && isFinite(Number(r.weekend_avg))) res.we[o] = Number(r.weekend_avg);
+    if (r.min_send_qty != null && isFinite(Number(r.min_send_qty))) res.mins[o] = Number(r.min_send_qty);
+    if (r.max_send_qty != null && isFinite(Number(r.max_send_qty))) res.maxs[o] = Number(r.max_send_qty);
+    if (res.wd[o] == null || res.we[o] == null) res.missingSales.push(name);
+  });
+  // near outlets = little dry ice (spec §2, §5): Gamdevi, Worli, Matunga, Bandra
+  const NEAR_NAMES = new Set(["gamdevi", "worli", "matunga", "bandra"]);
+  N.forEach((name, o) => {
+    if (NEAR_NAMES.has(normName(name))) res.near[o] = 1;
   });
   return res;
 }
