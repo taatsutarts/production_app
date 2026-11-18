@@ -351,11 +351,11 @@ export default function PlannerPage() {
   const [PS, setPS] = useState(initialExtras);
   const [PQ, setPQ] = useState(initialExtras);
   const [CK, setCK] = useState(initialCK);
-  // Kitchen "Sending" column: the quantities actually dispatched today, typed per
-  // flavour. Empty = the plan's own number (view.snd); a typed number pins what
-  // physically went out and drives "Left" (In CK − dispatched). Saved per date.
-  const [DS, setDS] = useState({});
   const [PROD, setPROD] = useState(initialProd);
+  // Kitchen "Dispatched" column: what actually went out for this dispatch date,
+  // from the `dispatches` table (same source the daily stock report reads).
+  // null = loading; once loaded it is indexed like FL.
+  const [DSPD, setDSPD] = useState(null);
   // outlet sales averages + freezer capacity + send limits come only from the outlets
   // table (weekday_avg / weekend_avg / fridge_capacity / min_send_qty / max_send_qty);
   // null = still loading — the plan stays blocked until the whole config has arrived
@@ -382,6 +382,9 @@ export default function PlannerPage() {
   const [poc, setPoc] = useState(null);
   // SKU codes from the items table (delivery challans); {} until the fetch lands
   const [skus, setSkus] = useState({});
+  // items-table id -> item_name, so `dispatches.item_id` rows can be mapped to a
+  // flavour (the Kitchen fold's Dispatched column) without another round trip
+  const [itemById, setItemById] = useState({});
   // Sunday emergency dispatch (spec section 13: kitchen closed — the page shows Monday's
   // plan and only dispatches today when the owner presses the button)
   const [forceSunday, setForceSunday] = useState(false);
@@ -441,19 +444,61 @@ export default function PlannerPage() {
       .then(({ data }) => setBrand(data || null));
   }, []);
 
-  // SKU codes for the delivery challans come from the items table (anon-readable)
+  // SKU codes for the delivery challans come from the items table (anon-readable);
+  // the same fetch keeps an id -> name map for the Dispatched column
   useEffect(() => {
     fetch("/api/items")
       .then((r) => r.json())
       .then((j) => {
         const m = {};
+        const byId = {};
         (j.items || []).forEach((it) => {
+          byId[it.id] = it.item_name;
           if (it.sku) m[normItem(it.item_name)] = it.sku;
         });
         setSkus(m);
+        setItemById(byId);
       })
       .catch(() => {});
   }, []);
+
+  // Kitchen "Dispatched": what really went out for this dispatch date, summed per
+  // flavour from the `dispatches` table (the source the Dispatches page and the
+  // daily stock report read). Packaging rows have item_id null and are skipped.
+  // UTC day window, same as the daily stock report. null = loading / no names yet.
+  useEffect(() => {
+    if (!date || !Object.keys(itemById).length) return;
+    let alive = true;
+    setDSPD(null);
+    const start = `${date}T00:00:00+00:00`;
+    const [y, mo, da] = date.split("-").map(Number);
+    const end = `${new Date(Date.UTC(y, mo - 1, da + 1)).toISOString().slice(0, 10)}T00:00:00+00:00`;
+    supabase
+      .from("dispatches")
+      .select("item_id,qty")
+      .not("item_id", "is", null)
+      .gte("dispatched_at", start)
+      .lt("dispatched_at", end)
+      .then(({ data, error }) => {
+        if (!alive || error) return;
+        const idx = {};
+        FL.forEach((f, i) => {
+          idx[normItem(f[0])] = i;
+        });
+        const arr = FL.map(() => 0);
+        (data || []).forEach((r) => {
+          const nm = itemById[r.item_id];
+          if (!nm) return;
+          const i = idx[normItem(nm)];
+          if (i == null) return;
+          arr[i] += Number(r.qty) || 0;
+        });
+        setDSPD(arr);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [date, itemById]);
 
   // Kitchen "In CK" starts from the real last-day closing stock (daily stock report "Opening",
   // TARTS only) for the day before the plan date. Changing the plan date re-fetches.
@@ -738,7 +783,6 @@ export default function PlannerPage() {
     if (p.manual) { setManual(p.manual); setOptIdx(-1); }
     else if (typeof p.optIdx == "number" && p.optIdx >= 0 && (!p.optLabel || (OPTS[p.optIdx] ? OPTS[p.optIdx].l : null) == p.optLabel)) setOptIdx(p.optIdx);
     if (p.ck) setCK((a) => with1d(a, p.ck));
-    if (p.ds && typeof p.ds == "object") setDS(p.ds);
     if (p.ps) setPS((m) => withEdits(m, p.ps));
     if (p.pq) setPQ((m) => withEdits(m, p.pq));
   }, [date, stockInfo, ckInfo, configInfo, OPTS]);
@@ -810,11 +854,8 @@ export default function PlannerPage() {
     };
   }, [d, planning, configOk, ctx, SEL, SELV, FORCE, EXTRAS, effSt, effD, capw, CK, PROD, OPTS, LLS, KITP]);
 
-  // Kitchen "Sending" column: per flavour, a typed dispatched number (DS) wins over
-  // the plan's own send; the header and "Left" follow the same numbers, so what the
-  // owner records as dispatched is what the kitchen maths uses.
-  const DISP = view ? FL.map((_f, i) => (DS[i] != null ? DS[i] : view.snd[i])) : [];
-  const DISP_T = DISP.reduce((a, b) => a + (Number(b) || 0), 0);
+  // "Dispatched" total for the Kitchen fold header (0 while the table loads)
+  const DSP_T = DSPD ? DSPD.reduce((a, b) => a + (Number(b) || 0), 0) : 0;
 
   // Sunday preview: which outlets would be critical on Monday (shown while the
   // kitchen is closed, before the owner decides on an emergency dispatch)
@@ -1802,8 +1843,9 @@ export default function PlannerPage() {
                               : "opening: no stock entry — manual values"}
                         </span>
                         <span className="tabular-nums">{view.ckT} in stock</span>
-                        <span className={mute}>sending {DISP_T}</span>
-                        <Badge t={view.ckT - DISP_T < 0 ? "red" : "green"}>{view.ckT - DISP_T} left</Badge>
+                        <span className={mute}>sending {view.sT}</span>
+                        <span className={mute}>dispatched {DSPD ? DSP_T : "…"}</span>
+                        {DSPD && <Badge t={view.ckT - DSP_T < 0 ? "red" : "green"}>{view.ckT - DSP_T} left</Badge>}
                       </div>
                     }
                   >
@@ -1815,21 +1857,22 @@ export default function PlannerPage() {
                     )}
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm">
-                        <thead><tr><th className={th}>Flavour</th><th className={th}>In CK</th><th className={th}>Sending</th><th className={th}>Left</th></tr></thead>
+                        <thead><tr><th className={th}>Flavour</th><th className={th}>In CK</th><th className={th}>Sending</th><th className={th}>Dispatched</th><th className={th}>Left</th></tr></thead>
                         <tbody>
                           {FL.map((f, i) => (
                             <tr key={f[0]} className={row}>
                               <td className={td}>{f[0]}</td>
                               <td className={td}><NumInput value={CK[i]} step={6} label={`${f[0]} in CK`} onCommit={(v) => { set1d(setCK, i, v); savePlanMap("ck", i, v); }} /></td>
-                              <td className={td}><NumInput value={DISP[i]} step={6} label={`${f[0]} dispatched`} onCommit={(v) => { setDS((d) => ({ ...d, [i]: v })); savePlanMap("ds", i, v); }} /></td>
-                              <td className={`${td} tabular-nums ${CK[i] - DISP[i] < 0 ? "font-semibold text-rose-600" : ""}`}>{CK[i] - DISP[i]}</td>
+                              <td className={`${td} tabular-nums`}>{view.snd[i]}</td>
+                              <td className={`${td} tabular-nums`}>{DSPD ? DSPD[i] : "…"}</td>
+                              <td className={`${td} tabular-nums ${DSPD && CK[i] - DSPD[i] < 0 ? "font-semibold text-rose-600" : ""}`}>{DSPD ? CK[i] - DSPD[i] : "…"}</td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
                     </div>
                     <div className={`${mute} mt-2`}>
-                      Sending is editable — type the quantity actually dispatched per flavour and Left shows what remains in the kitchen (In CK − dispatched). Untouched, it follows the plan&apos;s own send.
+                      Dispatched comes from the dispatches table for this date (the same numbers as the Dispatches page — edit them there). Left = In CK − dispatched.
                     </div>
                   </Fold>
                 </div>
