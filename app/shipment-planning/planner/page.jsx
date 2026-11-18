@@ -366,7 +366,7 @@ export default function PlannerPage() {
   const [maxs, setMaxs] = useState(null); // outlets.max_send_qty per outlet (null entry = off)
   // company + FSSAI for the delivery challans come from the brands table (Taatsu row)
   const [brand, setBrand] = useState(null);
-  // source info for the Kitchen "In CK" values (last day's closing stock from the daily stock report)
+  // source info for the Kitchen "Opening" values (last day's closing stock from the daily stock report)
   const [ckInfo, setCkInfo] = useState(null);
   // source info for the outlet stock table (stores_closing_stock entries, sheet fallback)
   const [stockInfo, setStockInfo] = useState(null);
@@ -500,7 +500,7 @@ export default function PlannerPage() {
     };
   }, [date, itemById]);
 
-  // Kitchen "In CK" starts from the real last-day closing stock (daily stock report "Opening",
+  // Kitchen "Opening" starts from the real last-day closing stock (daily stock report "Opening",
   // TARTS only) for the day before the plan date. Changing the plan date re-fetches.
   useEffect(() => {
     if (!date) return;
@@ -731,14 +731,23 @@ export default function PlannerPage() {
   const R = { ...ENGINE_DEFAULTS, ...(rules || {}) };
   const D = R.daysOfStock;
 
+  // Kitchen stock available to the plan = Opening − what has already been
+  // dispatched for this date (owner rule 2026-11-18: shipments are planned on
+  // the net stock, never on the untouched opening). Clamped at 0 so a data entry
+  // that dispatched more than the opening cannot create stock.
+  const CKN = useMemo(
+    () => CK.map((v, i) => Math.max(0, (Number(v) || 0) - (DSPD?.[i] || 0))),
+    [CK, DSPD]
+  );
+
   const ctx = useMemo(
     () => ({
       N, Z, NEAR, CITY: N.map((_n, o) => (Z[o] == "P" ? "Pune" : "Mumbai")), FL,
-      S: effS, CK, WD, WE, CAPW: capw, LL: LLS, KIT: KITP, CKS: R.cksLimit, DAYS: D,
+      S: effS, CK: CKN, WD, WE, CAPW: capw, LL: LLS, KIT: KITP, CKS: R.cksLimit, DAYS: D,
       MIN: mins, MAX: maxs, OV, OVB, OVT, VEH,
       SET: { ...(rules || {}) },
     }),
-    [effS, CK, WD, WE, capw, mins, maxs, D, R.cksLimit, LLS, KITP, OV, OVB, OVT, rules, VEH]
+    [effS, CKN, WD, WE, capw, mins, maxs, D, R.cksLimit, LLS, KITP, OV, OVB, OVT, rules, VEH]
   );
 
   // the mapped outlets-table config; the plan only renders once every outlet has
@@ -834,6 +843,7 @@ export default function PlannerPage() {
     const chosenIds = trips.flatMap((x) => x.stops);
     const snd = FL.map((_f, i) => sum(chosenIds.map((o) => (P2.q[o] || [])[i] || 0)));
     const ckT = ckTot(CK), sT = sum(snd);
+    const dT = DSPD ? sum(DSPD.map((v) => Number(v) || 0)) : 0;
     // tomorrow preview: stock after today's dispatch, then tomorrow's sales.
     // An outlet we are already serving today is never listed — the owner sees
     // only NEW problems left for tomorrow (owner rule 2026-11-18)
@@ -841,7 +851,7 @@ export default function PlannerPage() {
     const tmInfo = criticality(ctx, tmSt, addDays(effD, 1));
     return {
       P: P2, trips, totU, veh, dkg, dkc, ctc, tot,
-      snd, ckT, sT, left: ckT - sT,
+      snd, ckT, sT, dT, left: ckT - dT - sT,
       chosenIds,
       tmCritical: tmInfo.filter((x) => x.critical && !chosenIds.includes(x.o)),
       costs: OPTS.map((op) => {
@@ -852,10 +862,7 @@ export default function PlannerPage() {
       }),
       week: engineWeekRows(ctx, P2, PROD, { ...SELV, ...Object.fromEntries(mTrips.map((x) => [x.t.key, x.c.k])) }, FORCE, isoDate(effD)),
     };
-  }, [d, planning, configOk, ctx, SEL, SELV, FORCE, EXTRAS, effSt, effD, capw, CK, PROD, OPTS, LLS, KITP]);
-
-  // "Dispatched" total for the Kitchen fold header (0 while the table loads)
-  const DSP_T = DSPD ? DSPD.reduce((a, b) => a + (Number(b) || 0), 0) : 0;
+  }, [d, planning, configOk, ctx, SEL, SELV, FORCE, EXTRAS, effSt, effD, capw, CK, DSPD, PROD, OPTS, LLS, KITP]);
 
   // Sunday preview: which outlets would be critical on Monday (shown while the
   // kitchen is closed, before the owner decides on an emergency dispatch)
@@ -1842,10 +1849,10 @@ export default function PlannerPage() {
                               ? `opening ${ckInfo.date}`
                               : "opening: no stock entry — manual values"}
                         </span>
-                        <span className="tabular-nums">{view.ckT} in stock</span>
+                        <span className="tabular-nums">{view.ckT} Opening</span>
+                        <span className={mute}>dispatched {DSPD ? view.dT : "…"}</span>
                         <span className={mute}>sending {view.sT}</span>
-                        <span className={mute}>dispatched {DSPD ? DSP_T : "…"}</span>
-                        {DSPD && <Badge t={view.ckT - DSP_T < 0 ? "red" : "green"}>{view.ckT - DSP_T} left</Badge>}
+                        {DSPD && <Badge t={view.left < 0 ? "red" : "green"}>{view.left} left</Badge>}
                       </div>
                     }
                   >
@@ -1857,22 +1864,22 @@ export default function PlannerPage() {
                     )}
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm">
-                        <thead><tr><th className={th}>Flavour</th><th className={th}>In CK</th><th className={th}>Sending</th><th className={th}>Dispatched</th><th className={th}>Left</th></tr></thead>
+                        <thead><tr><th className={th}>Flavour</th><th className={th}>Opening</th><th className={th}>Dispatched</th><th className={th}>Sending</th><th className={th}>Left</th></tr></thead>
                         <tbody>
                           {FL.map((f, i) => (
                             <tr key={f[0]} className={row}>
                               <td className={td}>{f[0]}</td>
-                              <td className={td}><NumInput value={CK[i]} step={6} label={`${f[0]} in CK`} onCommit={(v) => { set1d(setCK, i, v); savePlanMap("ck", i, v); }} /></td>
-                              <td className={`${td} tabular-nums`}>{view.snd[i]}</td>
+                              <td className={td}><NumInput value={CK[i]} step={6} label={`${f[0]} opening`} onCommit={(v) => { set1d(setCK, i, v); savePlanMap("ck", i, v); }} /></td>
                               <td className={`${td} tabular-nums`}>{DSPD ? DSPD[i] : "…"}</td>
-                              <td className={`${td} tabular-nums ${DSPD && CK[i] - DSPD[i] < 0 ? "font-semibold text-rose-600" : ""}`}>{DSPD ? CK[i] - DSPD[i] : "…"}</td>
+                              <td className={`${td} tabular-nums`}>{view.snd[i]}</td>
+                              <td className={`${td} tabular-nums ${DSPD && CK[i] - DSPD[i] - view.snd[i] < 0 ? "font-semibold text-rose-600" : ""}`}>{DSPD ? CK[i] - DSPD[i] - view.snd[i] : "…"}</td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
                     </div>
                     <div className={`${mute} mt-2`}>
-                      Dispatched comes from the dispatches table for this date (the same numbers as the Dispatches page — edit them there). Left = In CK − dispatched.
+                      Opening is the kitchen closing stock for the day before (editable). Dispatched comes from the dispatches table for this date (edit it on the Dispatches page). Shipments are planned from Opening − Dispatched; Left = Opening − dispatched − sending.
                     </div>
                   </Fold>
                 </div>
