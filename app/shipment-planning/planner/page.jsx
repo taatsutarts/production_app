@@ -713,6 +713,10 @@ export default function PlannerPage() {
   );
   const SEL = optIdx >= 0 ? (OPTS[optIdx] ? OPTS[optIdx].ids : []) : manual;
   const FORCE = optIdx >= 0 && OPTS[optIdx] ? OPTS[optIdx].f : null;
+  // outlets carried by a manual trip ("+ Add trip"): they left the auto plan and their
+  // quantities come from the manual allocation — every fold that lists the plan's
+  // outlets must include them too, or their numbers are invisible (2026-11-18 bug)
+  const MOVED = (EXTRAS || []).flatMap((e) => e.ids || []);
 
   // restore this date's saved plan once every data source (outlets config, closing
   // stock, CK opening) has settled — the loaders' redo() above drops overrides, so
@@ -891,6 +895,15 @@ export default function PlannerPage() {
     const nT = del(OVT, o);
     setOVB(nB); setOVT(nT);
     savePlan({ OVB: nB, OVT: nT });
+  };
+  // drop an outlet's typed overrides (total / boxes) — the engine's own rules
+  // (shelf-life fill, min/max) set the quantity again; e.g. clears a stale
+  // typed total that kept forcing an odd number onto an outlet
+  const clearOverride = (o) => {
+    const nT = del(OVT, o);
+    const nB = del(OVB, o);
+    setOVT(nT); setOVB(nB);
+    savePlan({ OVT: nT, OVB: nB });
   };
   const set2d = (setter, o, j, v) => setter((s) => s.map((r, oi) => (oi == o ? r.map((x, ji) => (ji == j ? v : x)) : r)));
   const set1d = (setter, i, v) => setter((a) => a.map((x, k) => (k == i ? v : x)));
@@ -1342,6 +1355,7 @@ export default function PlannerPage() {
                             {effSt[o]} · {cv == null || cv === Infinity ? "–" : cv.toFixed(1) + "d"}
                           </span>
                           {deferred && <Badge t="amber">waits</Badge>}
+                          {MOVED.includes(o) && <Badge t="green">manual trip</Badge>}
                         </button>
                       );
                     })}
@@ -1388,7 +1402,7 @@ export default function PlannerPage() {
                     <div className={card}>
                       <div className="font-semibold">Add a trip</div>
                       <div className={`${mute} mt-1`}>
-                        Send an extra run with a vehicle of your choice: pick the vehicle and the outlets. Their planned quantities move onto this run (and off the auto plan) — a fresh allocation rules the amount, still editable in each outlet&apos;s quantities fold.
+                        Send an extra run with a vehicle of your choice: pick the vehicle and the outlets. Their planned quantities move onto this run (and off the auto plan) — a fresh allocation rules the amount, still editable in each outlet&apos;s quantities fold (outlets on a manual trip are listed there too, tagged “manual trip”, and marked in the Outlets row).
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-1.5">
                         {["es", "el", "ef", "pv"].map((k) => (
@@ -1529,6 +1543,7 @@ export default function PlannerPage() {
                                 <div className="font-medium">
                                   {N[o]}
                                   {auto && <span className={`${mute} font-normal`}> · auto</span>}
+                                  {(ctx.OVT?.[o] != null || ctx.OVB?.[o] != null) && <Badge t="amber">typed</Badge>}
                                 </div>
                                 <div className={mute}>
                                   {view.P.u[o] || 0} tarts · holds {bcap(bx)}{c.m == "t" ? ` · ${dry(ctx, o, bx).toFixed(1)} kg ice` : ""}
@@ -1605,8 +1620,10 @@ export default function PlannerPage() {
                 {/* quantities and stock */}
                 <section className="order-7 flex flex-col gap-3 lg:col-span-2">
                   <h2 className={`${title} px-1`}>Quantities</h2>
-                  {SEL.length == 0 && <div className={`${card} ${mute}`}>No outlet selected.</div>}
-                  {SEL.map((o) => {
+                  {SEL.length == 0 && MOVED.length == 0 && <div className={`${card} ${mute}`}>No outlet selected.</div>}
+                  {/* manual-trip outlets ride at the end: their quantities come from the
+                     manual allocation and they are only visible/editable here */}
+                  {SEL.concat(MOVED.filter((o) => !SEL.includes(o))).map((o) => {
                     const U = view.P.u[o] || 0, after = effSt[o] + U, rm = (capw[o] || 0) - after;
                     const info = view.P.info[o];
                     const cv = info ? info.cover : NaN;
@@ -1624,6 +1641,9 @@ export default function PlannerPage() {
                               {Z[o] == "P" && after > 918 && rm >= 0 && <Badge t="amber">above 918</Badge>}
                               {U < r6((capw[o] || 0) - effSt[o]) && <Badge t="amber">partial fill</Badge>}
                               {info && info.low.length > 0 && <Badge t="amber">{info.low.length} low flavour{info.low.length == 1 ? "" : "s"}</Badge>}
+                              {MOVED.includes(o) && <Badge t="green">manual trip</Badge>}
+                              {ctx.OVT?.[o] != null && <Badge t="amber">typed total</Badge>}
+                              {ctx.OVB?.[o] != null && <Badge t="amber">typed boxes</Badge>}
                             </div>
                             <div className="mt-1.5 flex items-center gap-2">
                               <Bar value={after} max={capw[o]} over={rm < 0} />
@@ -1636,6 +1656,15 @@ export default function PlannerPage() {
                           <label className="flex items-center gap-2">
                             <span className={mute}>Total</span>
                             <NumInput value={U} step={6} label={`${N[o]} total tarts`} onCommit={(v) => editTotal(o, v)} w="w-20" />
+                            {(ctx.OVT?.[o] != null || ctx.OVB?.[o] != null) && (
+                              <button
+                                onClick={() => clearOverride(o)}
+                                title="Remove the typed number — the planner's own rules (shelf life, min/max, stock) set this outlet's total again"
+                                className="cursor-pointer rounded-full border border-slate-200 px-2 py-0.5 text-xs font-medium text-slate-500 hover:border-slate-400 hover:text-slate-700 dark:border-slate-700 dark:hover:border-slate-500 dark:hover:text-slate-300"
+                              >
+                                auto
+                              </button>
+                            )}
                           </label>
                           <span className={mute}>
                             {info ? info.reason : `${isNaN(cv) ? "–" : cv.toFixed(1)} days left`} · {WD[o]}/day · {WE[o]} weekends
