@@ -238,12 +238,11 @@ export function criticality(ctx, st, d) {
 export const criticalOutlets = (ctx, st, d) =>
   criticality(ctx, st, d).filter((x) => x.critical).map((x) => x.o);
 
-/* Does this outlet actually need stock today? (owner rule 2026-11-18: free
- * drops and return-run top-ups may only go to outlets that are running out —
- * never to one sitting on days of stock just because the van has room.)
- * True when the TOTAL cover is under the critical bar (daysOfStock), or when
- * 2+ classic flavours are under lowFlavourDays ("more than one flavour running
- * dry = flag and send"), even if the total looks healthy. */
+/* Does this outlet actually need stock today? (owner rule 2026-11-18: a return-run
+ * top-up may only go to an outlet that is running out — never to one sitting on
+ * days of stock.) True when the TOTAL cover is under the critical bar (daysOfStock),
+ * or when 2+ classic flavours are under lowFlavourDays ("more than one flavour
+ * running dry = flag and send"), even if the total looks healthy. */
 function needsStock(ctx, o, d, st) {
   const C = cfg(ctx);
   if (cover(ctx, o, d, st[o] || 0) < C.daysOfStock) return true;
@@ -457,7 +456,7 @@ export function minSend(ctx, o) {
 /* Fill each outlet to its freezer capacity (multiple of 6), capped by the
  * shelf-life limit, served most-urgent-first and clamped by kitchen stock.
  * `ckStart` lets the caller continue from stock left by an earlier pass
- * (used for free extra drops). Returns { q, u, T, left }. */
+ * (used for return-run top-ups). Returns { q, u, T, left }. */
 export function allocate(ctx, ids, st, d, ov, ckStart) {
   const C = cfg(ctx);
   const CK = (ckStart || ctx.CK || []).slice();
@@ -655,61 +654,8 @@ export function groupTrips(ctx, sel, st, d) {
 }
 
 /* ------------------------------------------------------------------ */
-/* extras + return run                                                 */
+/* return run                                                          */
 /* ------------------------------------------------------------------ */
-
-/* Free extra drops: a van fare is flat, so add nearby non-critical outlets when
- * the boxes fit the small van and the stop rules allow (owner rules 2026-11-16:
- * Eco <= maxStops, <= maxNear inside the kitchen radius, <= maxFar beyond it). */
-export function freeExtras(ctx, trip, q, u, st, d, ckLeft, sel) {
-  const C = cfg(ctx);
-  if (trip.kind === "pune") return { ids: [], q: {}, u: {}, used: 0 };
-  const vE = vehOf(ctx, "es");
-  const esDL = dropLimits(ctx, "es");
-  const maxNear = vE.maxNear != null ? vE.maxNear : esDL.max; // no radius rule -> only the total binds
-  const maxFar = vE.maxFar != null ? vE.maxFar : esDL.max;
-  const inTrip = new Set(trip.ids);
-  const candidates = ctx.N
-    .map((_n, o) => o)
-    .filter((o) => !inTrip.has(o) && zoneOf(ctx, o) !== "P" && ctx.NEAR?.[o] && !sel.includes(o))
-    .filter((o) => !(ctx.NOEX || []).includes(o)) // owner refused this free drop ("✕" on the trip card)
-    .filter((o) => needsStock(ctx, o, d, st)) // only outlets that are actually running out
-    .filter((o) => sendRoom(ctx, o, st) >= 300)
-    .filter((o) => !has(ctx, o, "thane") && !has(ctx, o, "goregaon"))
-    .sort((a, b) => cover(ctx, a, d, st[a]) - cover(ctx, b, d, st[b]));
-
-  const ids = [];
-  // extras must fit the small van (the flat-fare vehicle); otherwise they are a
-  // separate return run, not a free drop.
-  let used = sum(trip.ids.map((o) => {
-    const b = thA(u[o] || 0, C);
-    return b.a + b.b / 2;
-  }));
-  // the Eco in-radius budget: stops already on the trip, plus the extras added here
-  let nearStops = trip.ids.filter((o) => inRadius(ctx, o)).length;
-  let farStops = trip.ids.length - nearStops;
-  let addedNear = 0;
-  let addedFar = 0;
-  for (const o of candidates) {
-    if (trip.ids.length + ids.length >= esDL.max) break;
-    const isNear = inRadius(ctx, o);
-    if (isNear ? nearStops + addedNear >= maxNear : farStops + addedFar >= maxFar) continue;
-    const need = Math.min(
-      sendRoom(ctx, o, st),
-      r6(salesOverDays(ctx, o, d, C.shelfLifeDays)),
-    );
-    const b = thA(need, C);
-    const slots = b.a + b.b / 2;
-    if (used + slots > vE.cap + 1e-9) continue;
-    ids.push(o);
-    used += slots;
-    if (isNear) addedNear++;
-    else addedFar++;
-  }
-  if (!ids.length) return { ids: [], q: {}, u: {}, used: 0 };
-  const extra = allocate(ctx, ids, st, d, null, ckLeft);
-  return { ids, q: extra.q, u: extra.u, used: sum(Object.values(extra.u)), left: extra.left };
-}
 
 /* Return run (split run, section 12 + owner rule 2026-11-16): drop the in-radius
  * outlets first, come back to the kitchen, reload, then do the far run on the same
@@ -725,7 +671,6 @@ export function returnRunOptions(ctx, trip, q, u, st, d, ckLeft, opts) {
   const nearCands = ctx.N
     .map((_n, o) => o)
     .filter((o) => inRadius(ctx, o) && !trip.ids.includes(o))
-    .filter((o) => !(ctx.NOEX || []).includes(o)) // owner refused this outlet as a free drop today
     .filter((o) => sendRoom(ctx, o, st) >= 300)
     .filter((o) => needsStock(ctx, o, d, st)) // only outlets that are actually running out
     .sort((a, b) => cover(ctx, a, d, st[a]) - cover(ctx, b, d, st[b]));
@@ -817,23 +762,10 @@ export function buildPlan(ctx, sel, st, d, ov) {
     return { ...t, key: t.ids.join("-"), U, o: opts };
   });
 
-  // free extras for Everest trips (flat fare, spare drops)
-  const withExtras = trips.map((t) => {
-    if (t.kind === "pune") return { ...t, extras: { ids: [], q: {}, u: {} } };
-    const ex = freeExtras(ctx, t, q, u, st, d, alloc.left, sel);
-    if (!ex.ids.length) return { ...t, extras: { ids: [], q: {}, u: {} } };
-    ex.ids.forEach((o) => {
-      q[o] = ex.q[o] || q[o] || 0;
-      u[o] = ex.u[o] || u[o] || 0;
-    });
-    const U = t.U + sum(ex.ids.map((o) => u[o] || 0));
-    const ids = t.ids.concat(ex.ids);
-    // Thane still has to be the last stop after extras are appended
-    const thane = ids.find((o) => has(ctx, o, "thane"));
-    const ordered = orderStops(ctx, ids, -1, thane != null ? thane : null);
-    const opts = vehicleOptions(ctx, ordered, Object.fromEntries(ordered.map((o) => [o, u[o] || 0])), ov, t.kind);
-    return { ...t, ids: ordered, U, key: ordered.join("-"), o: opts, extras: ex };
-  });
+  // no automatic extra drops any more (owner 2026-11-18: dispatch only the
+  // outlets that were actually selected or planned — never unrequested top-ups);
+  // the field stays so trip objects keep the same shape
+  const withExtras = trips.map((t) => ({ ...t, extras: { ids: [], q: {}, u: {} } }));
 
   // return-run options (and their quantities) for each Mumbai trip
   const finalTrips = withExtras.map((t) => {
