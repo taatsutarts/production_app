@@ -655,6 +655,7 @@ export function freeExtras(ctx, trip, q, u, st, d, ckLeft, sel) {
   const candidates = ctx.N
     .map((_n, o) => o)
     .filter((o) => !inTrip.has(o) && zoneOf(ctx, o) !== "P" && ctx.NEAR?.[o] && !sel.includes(o))
+    .filter((o) => !(ctx.NOEX || []).includes(o)) // owner refused this free drop ("✕" on the trip card)
     .filter((o) => sendRoom(ctx, o, st) >= 300)
     .filter((o) => !has(ctx, o, "thane") && !has(ctx, o, "goregaon"))
     .sort((a, b) => cover(ctx, a, d, st[a]) - cover(ctx, b, d, st[b]));
@@ -706,6 +707,7 @@ export function returnRunOptions(ctx, trip, q, u, st, d, ckLeft, opts) {
   const nearCands = ctx.N
     .map((_n, o) => o)
     .filter((o) => inRadius(ctx, o) && !trip.ids.includes(o))
+    .filter((o) => !(ctx.NOEX || []).includes(o)) // owner refused this outlet as a free drop today
     .filter((o) => sendRoom(ctx, o, st) >= 300)
     .filter((o) => cover(ctx, o, d, st[o]) < C.shelfLifeDays)
     .sort((a, b) => cover(ctx, a, d, st[a]) - cover(ctx, b, d, st[b]));

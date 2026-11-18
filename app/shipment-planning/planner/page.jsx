@@ -407,6 +407,11 @@ export default function PlannerPage() {
   // manual trip leave the auto plan and its quantities; the vehicle is fixed
   // (stored here, not in SELV, so redo() cannot lose it). Saved per date.
   const [EXTRAS, setEXTRAS] = useState([]);
+  // outlets the owner refused as a free extra drop for this date ("✕" on the trip
+  // card): the engine's flat-fare trips auto-load nearby outlets from leftover
+  // kitchen stock; NOEX keeps them off. Real (critical/auto-selected) stops are
+  // never blocked by it. Survives redo() like EXTRAS — it is a per-date choice.
+  const [NOEX, setNOEX] = useState([]);
   // the "+ Add trip" form: null = closed, else { vk, ids } while composing
   const [newTrip, setNewTrip] = useState(null);
   // quantities accordion: the one fold that is open (outlet index; -1 = none; null = not initialized yet)
@@ -686,10 +691,10 @@ export default function PlannerPage() {
     () => ({
       N, Z, NEAR, CITY: N.map((_n, o) => (Z[o] == "P" ? "Pune" : "Mumbai")), FL,
       S: effS, CK, WD, WE, CAPW: capw, LL: LLS, KIT: KITP, CKS: R.cksLimit, DAYS: D,
-      MIN: mins, MAX: maxs, OV, OVB, OVT, VEH,
+      MIN: mins, MAX: maxs, OV, OVB, OVT, VEH, NOEX,
       SET: { ...(rules || {}) },
     }),
-    [effS, CK, WD, WE, capw, mins, maxs, D, R.cksLimit, LLS, KITP, OV, OVB, OVT, rules, VEH]
+    [effS, CK, WD, WE, capw, mins, maxs, D, R.cksLimit, LLS, KITP, OV, OVB, OVT, rules, VEH, NOEX]
   );
 
   // the mapped outlets-table config; the plan only renders once every outlet has
@@ -731,6 +736,7 @@ export default function PlannerPage() {
     if (p.OVT) setOVT(p.OVT);
     if (p.SELV) setSELV(p.SELV);
     if (p.EXTRAS) setEXTRAS(Array.isArray(p.EXTRAS) ? p.EXTRAS : []);
+    if (p.NOEX) setNOEX(Array.isArray(p.NOEX) ? p.NOEX : []);
     if (p.manual) { setManual(p.manual); setOptIdx(-1); }
     else if (typeof p.optIdx == "number" && p.optIdx >= 0 && (!p.optLabel || (OPTS[p.optIdx] ? OPTS[p.optIdx].l : null) == p.optLabel)) setOptIdx(p.optIdx);
     if (p.ck) setCK((a) => with1d(a, p.ck));
@@ -874,6 +880,13 @@ export default function PlannerPage() {
     setNewTrip(null);
   };
   const removeExtra = (i) => saveExtras(EXTRAS.filter((_e, j) => j != i));
+  // refuse a free extra drop for today ("✕" next to it on the trip card): the
+  // outlet stays home unless the planner picks it as a real stop on its own
+  const removeExtraStop = (o) => {
+    const n = NOEX.includes(o) ? NOEX : NOEX.concat(o);
+    setNOEX(n);
+    savePlan({ NOEX: n });
+  };
   // change a manual trip's vehicle (stored in EXTRAS — redo() must not lose it)
   const setExtraVeh = (i, vk) => saveExtras(EXTRAS.map((e, j) => (j == i ? { ...e, vk } : e)));
   const del = (obj, k) => { const n = { ...obj }; delete n[k]; return n; };
@@ -1341,7 +1354,7 @@ export default function PlannerPage() {
                         <button
                           key={o}
                           onClick={() => toggleOutlet(o)}
-                          title={info ? info.reason : ""}
+                          title={(info ? info.reason : "") + (NOEX.includes(o) ? " · free extra drop removed for today (✕ on the trip card)" : "")}
                           className={`flex cursor-pointer items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm font-medium transition ${
                             on
                               ? "border-slate-900 bg-slate-900 text-white dark:border-white dark:bg-white dark:text-slate-900"
@@ -1356,6 +1369,7 @@ export default function PlannerPage() {
                           </span>
                           {deferred && <Badge t="amber">waits</Badge>}
                           {MOVED.includes(o) && <Badge t="green">manual trip</Badge>}
+                          {NOEX.includes(o) && !SEL.includes(o) && <Badge t="amber">extra removed</Badge>}
                         </button>
                       );
                     })}
@@ -1402,7 +1416,7 @@ export default function PlannerPage() {
                     <div className={card}>
                       <div className="font-semibold">Add a trip</div>
                       <div className={`${mute} mt-1`}>
-                        Send an extra run with a vehicle of your choice: pick the vehicle and the outlets. Their planned quantities move onto this run (and off the auto plan) — a fresh allocation rules the amount, still editable in each outlet&apos;s quantities fold (outlets on a manual trip are listed there too, tagged “manual trip”, and marked in the Outlets row).
+                        Send an extra run with a vehicle of your choice: pick the vehicle and the outlets. Their planned quantities move onto this run (and off the auto plan) — a fresh allocation rules the amount, still editable in each outlet&apos;s quantities fold (outlets on a manual trip are listed there too, tagged “manual trip”, and marked in the Outlets row). Trips on flat-fare vehicles can also pick up nearby outlets automatically as <span className="font-medium">free extra drops</span> (tagged “extra drop” on the trip card) — the ✕ next to one refuses it for today.
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-1.5">
                         {["es", "el", "ef", "pv"].map((k) => (
@@ -1543,6 +1557,19 @@ export default function PlannerPage() {
                                 <div className="font-medium">
                                   {N[o]}
                                   {auto && <span className={`${mute} font-normal`}> · auto</span>}
+                                  {t.extras?.ids?.includes(o) && (
+                                    <>
+                                      {" "}
+                                      <Badge t="green">extra drop</Badge>
+                                      <button
+                                        onClick={() => removeExtraStop(o)}
+                                        title="Remove this free drop — the outlet stays home today (it can still be picked normally on another day)"
+                                        className="ml-1 cursor-pointer rounded-full border border-slate-200 px-1.5 text-xs font-medium text-slate-400 hover:border-rose-300 hover:text-rose-600 dark:border-slate-700 dark:hover:border-rose-800 dark:hover:text-rose-300"
+                                      >
+                                        ✕
+                                      </button>
+                                    </>
+                                  )}
                                   {(ctx.OVT?.[o] != null || ctx.OVB?.[o] != null) && <Badge t="amber">typed</Badge>}
                                 </div>
                                 <div className={mute}>
