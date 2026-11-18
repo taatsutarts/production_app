@@ -791,14 +791,16 @@ export default function PlannerPage() {
     const chosenIds = trips.flatMap((x) => x.stops);
     const snd = FL.map((_f, i) => sum(chosenIds.map((o) => (P2.q[o] || [])[i] || 0)));
     const ckT = ckTot(CK), sT = sum(snd);
-    // tomorrow preview: stock after today's dispatch, then tomorrow's sales
+    // tomorrow preview: stock after today's dispatch, then tomorrow's sales.
+    // An outlet we are already serving today is never listed — the owner sees
+    // only NEW problems left for tomorrow (owner rule 2026-11-18)
     const tmSt = projectStock(ctx, effSt, effD, Object.fromEntries(chosenIds.map((o) => [o, P2.u[o] || 0])), addDays(effD, 1));
     const tmInfo = criticality(ctx, tmSt, addDays(effD, 1));
     return {
       P: P2, trips, totU, veh, dkg, dkc, ctc, tot,
       snd, ckT, sT, left: ckT - sT,
       chosenIds,
-      tmCritical: tmInfo.filter((x) => x.critical),
+      tmCritical: tmInfo.filter((x) => x.critical && !chosenIds.includes(x.o)),
       costs: OPTS.map((op) => {
         if (!op.ids.length) return null;
         const p2 = buildPlan(ctx, op.ids, effSt, effD, false);
@@ -1247,7 +1249,7 @@ export default function PlannerPage() {
               )}
 
               <div className={`${mute} mt-2`}>
-                Private 3-wheeler: 1–{V("pv").maxStops} stops. Eco (small van): at most {V("es").maxNear} stops within {R.ecoRadiusKm} km of the kitchen + {V("es").maxFar} beyond, {V("es").maxStops} total — on a full mixed load it drops the near stops first and comes back to the kitchen before the far run. Large van and freezer van: up to {V("el").maxStops}/{V("ef").maxStops} stops anywhere in Mumbai; when the load outgrows one van the planner switches to the next bigger one automatically, and a trip nothing can carry is flagged in red. Minimum tarts: an outlet the planner picks itself always receives at least this much when the freezer has room — typed manual numbers always win; a typed 0 is a real zero (min 0 = no forced minimum for that outlet). Shelf life caps how much an outlet gets in one go (sales over N days — the product lasts 30 days from manufacturing, made the day before dispatch); the challans show the expiry (30 days from manufacturing). Every change applies to the plan immediately and saves to the database, so it holds on every device.
+                Private 3-wheeler: 1–{V("pv").maxStops} stops. Eco (small van): at most {V("es").maxNear} stops within {R.ecoRadiusKm} km of the kitchen + {V("es").maxFar} beyond, {V("es").maxStops} total — on a full mixed load it drops the near stops first and comes back to the kitchen before the far run. Large van and freezer van: up to {V("el").maxStops}/{V("ef").maxStops} stops anywhere in Mumbai; when the load outgrows one van the planner switches to the next bigger one automatically, and a trip nothing can carry is flagged in red. Flat-fare trips may also top up nearby outlets from the kitchen leftover as free extra drops — only outlets that are running out qualify (total stock under the critical bar, or 2+ flavours under 2 days); a ✕ on the trip card refuses one for the day. Minimum tarts: an outlet the planner picks itself always receives at least this much when the freezer has room — typed manual numbers always win; a typed 0 is a real zero (min 0 = no forced minimum for that outlet). Shelf life caps how much an outlet gets in one go (sales over N days — the product lasts 30 days from manufacturing, made the day before dispatch); the challans show the expiry (30 days from manufacturing). Every change applies to the plan immediately and saves to the database, so it holds on every device.
               </div>
             </div>
           </div>
@@ -1416,7 +1418,7 @@ export default function PlannerPage() {
                     <div className={card}>
                       <div className="font-semibold">Add a trip</div>
                       <div className={`${mute} mt-1`}>
-                        Send an extra run with a vehicle of your choice: pick the vehicle and the outlets. Their planned quantities move onto this run (and off the auto plan) — a fresh allocation rules the amount, still editable in each outlet&apos;s quantities fold (outlets on a manual trip are listed there too, tagged “manual trip”, and marked in the Outlets row). Trips on flat-fare vehicles can also pick up nearby outlets automatically as <span className="font-medium">free extra drops</span> (tagged “extra drop” on the trip card) — the ✕ next to one refuses it for today.
+                        Send an extra run with a vehicle of your choice: pick the vehicle and the outlets. Their planned quantities move onto this run (and off the auto plan) — a fresh allocation rules the amount, still editable in each outlet&apos;s quantities fold (outlets on a manual trip are listed there too, tagged “manual trip”, and marked in the Outlets row). Trips on flat-fare vehicles can also pick up nearby outlets automatically as <span className="font-medium">free extra drops</span> (tagged “extra drop” on the trip card) — only outlets that are genuinely running low qualify (total stock under the critical bar, or 2+ flavours under 2 days), and the ✕ next to one refuses it for today.
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-1.5">
                         {["es", "el", "ef", "pv"].map((k) => (

@@ -238,6 +238,23 @@ export function criticality(ctx, st, d) {
 export const criticalOutlets = (ctx, st, d) =>
   criticality(ctx, st, d).filter((x) => x.critical).map((x) => x.o);
 
+/* Does this outlet actually need stock today? (owner rule 2026-11-18: free
+ * drops and return-run top-ups may only go to outlets that are running out —
+ * never to one sitting on days of stock just because the van has room.)
+ * True when the TOTAL cover is under the critical bar (daysOfStock), or when
+ * 2+ classic flavours are under lowFlavourDays ("more than one flavour running
+ * dry = flag and send"), even if the total looks healthy. */
+function needsStock(ctx, o, d, st) {
+  const C = cfg(ctx);
+  if (cover(ctx, o, d, st[o] || 0) < C.daysOfStock) return true;
+  let low = 0;
+  ctx.FL.forEach((f, i) => {
+    if (!isClassic(f)) return;
+    if (flavourCover(ctx, o, i, d, Math.max(0, ctx.S?.[o]?.[i] || 0)) < C.lowFlavourDays) low++;
+  });
+  return low >= 2;
+}
+
 /* ------------------------------------------------------------------ */
 /* boxes, dry ice, packaging                                           */
 /* ------------------------------------------------------------------ */
@@ -656,6 +673,7 @@ export function freeExtras(ctx, trip, q, u, st, d, ckLeft, sel) {
     .map((_n, o) => o)
     .filter((o) => !inTrip.has(o) && zoneOf(ctx, o) !== "P" && ctx.NEAR?.[o] && !sel.includes(o))
     .filter((o) => !(ctx.NOEX || []).includes(o)) // owner refused this free drop ("✕" on the trip card)
+    .filter((o) => needsStock(ctx, o, d, st)) // only outlets that are actually running out
     .filter((o) => sendRoom(ctx, o, st) >= 300)
     .filter((o) => !has(ctx, o, "thane") && !has(ctx, o, "goregaon"))
     .sort((a, b) => cover(ctx, a, d, st[a]) - cover(ctx, b, d, st[b]));
@@ -709,7 +727,7 @@ export function returnRunOptions(ctx, trip, q, u, st, d, ckLeft, opts) {
     .filter((o) => inRadius(ctx, o) && !trip.ids.includes(o))
     .filter((o) => !(ctx.NOEX || []).includes(o)) // owner refused this outlet as a free drop today
     .filter((o) => sendRoom(ctx, o, st) >= 300)
-    .filter((o) => cover(ctx, o, d, st[o]) < C.shelfLifeDays)
+    .filter((o) => needsStock(ctx, o, d, st)) // only outlets that are actually running out
     .sort((a, b) => cover(ctx, a, d, st[a]) - cover(ctx, b, d, st[b]));
   if (!nearCands.length) return [];
 
