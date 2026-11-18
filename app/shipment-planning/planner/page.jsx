@@ -351,6 +351,10 @@ export default function PlannerPage() {
   const [PS, setPS] = useState(initialExtras);
   const [PQ, setPQ] = useState(initialExtras);
   const [CK, setCK] = useState(initialCK);
+  // Kitchen "Sending" column: the quantities actually dispatched today, typed per
+  // flavour. Empty = the plan's own number (view.snd); a typed number pins what
+  // physically went out and drives "Left" (In CK − dispatched). Saved per date.
+  const [DS, setDS] = useState({});
   const [PROD, setPROD] = useState(initialProd);
   // outlet sales averages + freezer capacity + send limits come only from the outlets
   // table (weekday_avg / weekend_avg / fridge_capacity / min_send_qty / max_send_qty);
@@ -734,6 +738,7 @@ export default function PlannerPage() {
     if (p.manual) { setManual(p.manual); setOptIdx(-1); }
     else if (typeof p.optIdx == "number" && p.optIdx >= 0 && (!p.optLabel || (OPTS[p.optIdx] ? OPTS[p.optIdx].l : null) == p.optLabel)) setOptIdx(p.optIdx);
     if (p.ck) setCK((a) => with1d(a, p.ck));
+    if (p.ds && typeof p.ds == "object") setDS(p.ds);
     if (p.ps) setPS((m) => withEdits(m, p.ps));
     if (p.pq) setPQ((m) => withEdits(m, p.pq));
   }, [date, stockInfo, ckInfo, configInfo, OPTS]);
@@ -804,6 +809,12 @@ export default function PlannerPage() {
       week: engineWeekRows(ctx, P2, PROD, { ...SELV, ...Object.fromEntries(mTrips.map((x) => [x.t.key, x.c.k])) }, FORCE, isoDate(effD)),
     };
   }, [d, planning, configOk, ctx, SEL, SELV, FORCE, EXTRAS, effSt, effD, capw, CK, PROD, OPTS, LLS, KITP]);
+
+  // Kitchen "Sending" column: per flavour, a typed dispatched number (DS) wins over
+  // the plan's own send; the header and "Left" follow the same numbers, so what the
+  // owner records as dispatched is what the kitchen maths uses.
+  const DISP = view ? FL.map((_f, i) => (DS[i] != null ? DS[i] : view.snd[i])) : [];
+  const DISP_T = DISP.reduce((a, b) => a + (Number(b) || 0), 0);
 
   // Sunday preview: which outlets would be critical on Monday (shown while the
   // kitchen is closed, before the owner decides on an emergency dispatch)
@@ -1791,8 +1802,8 @@ export default function PlannerPage() {
                               : "opening: no stock entry — manual values"}
                         </span>
                         <span className="tabular-nums">{view.ckT} in stock</span>
-                        <span className={mute}>sending {view.sT}</span>
-                        <Badge t={view.left < 0 ? "red" : "green"}>{view.left} left</Badge>
+                        <span className={mute}>sending {DISP_T}</span>
+                        <Badge t={view.ckT - DISP_T < 0 ? "red" : "green"}>{view.ckT - DISP_T} left</Badge>
                       </div>
                     }
                   >
@@ -1810,12 +1821,15 @@ export default function PlannerPage() {
                             <tr key={f[0]} className={row}>
                               <td className={td}>{f[0]}</td>
                               <td className={td}><NumInput value={CK[i]} step={6} label={`${f[0]} in CK`} onCommit={(v) => { set1d(setCK, i, v); savePlanMap("ck", i, v); }} /></td>
-                              <td className={`${td} tabular-nums`}>{view.snd[i]}</td>
-                              <td className={`${td} tabular-nums ${CK[i] - view.snd[i] < 0 ? "font-semibold text-rose-600" : ""}`}>{CK[i] - view.snd[i]}</td>
+                              <td className={td}><NumInput value={DISP[i]} step={6} label={`${f[0]} dispatched`} onCommit={(v) => { setDS((d) => ({ ...d, [i]: v })); savePlanMap("ds", i, v); }} /></td>
+                              <td className={`${td} tabular-nums ${CK[i] - DISP[i] < 0 ? "font-semibold text-rose-600" : ""}`}>{CK[i] - DISP[i]}</td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
+                    </div>
+                    <div className={`${mute} mt-2`}>
+                      Sending is editable — type the quantity actually dispatched per flavour and Left shows what remains in the kitchen (In CK − dispatched). Untouched, it follows the plan&apos;s own send.
                     </div>
                   </Fold>
                 </div>
