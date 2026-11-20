@@ -8,10 +8,15 @@
 //   items:       active master catalog for the review dropdowns
 //   resolved:    [ { line, item_id, item_name, how: "mapping" | "exact" } ] — confident only:
 //                this vendor's confirmed mapping, or an exact master-item name hit
+//   items[]:     each carries its Zoho defaults (account, ITC eligibility, location, brand_type)
+//   vendor_overrides: { [item_id]: { account_id, account_name, itc_eligibility, location, brand_type } }
+//                this vendor's own exceptions to those defaults (empty fields = use the item's)
+//   accounts / locations: the dropdown lists for the review screen (empty until the
+//                supabase_migration_zoho_bill_fields.sql migration + import have run)
 //   suggestions: [ { line, options: [ { id, item_name, score } ] } ] — cautious similarity
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
-import { norm, suggestItems, suggestVendors } from "@/lib/purchaseMatch";
+import { norm, suggestItems, suggestVendors, ZOHO_FIELD_COLS, isMissingColumn } from "@/lib/purchaseMatch";
 
 export const dynamic = "force-dynamic";
 
@@ -25,20 +30,26 @@ export async function POST(request) {
     const lines = Array.isArray(body.items) ? body.items : [];
 
     // 1. catalog + brands + vendor list (small tables — one call each)
-    const [itemsRes, brandsRes, vendorsRes] = await Promise.all([
-      sb
-        .from("purchase_items")
-        .select("id,item_name,brand_type,uom")
-        .eq("status", "Active")
-        .order("item_name"),
+    const loadItems = async () => {
+      const q = (cols) => sb.from("purchase_items").select(cols).eq("status", "Active").order("item_name");
+      const wide = await q("id,item_name,brand_type,uom," + ZOHO_FIELD_COLS);
+      return isMissingColumn(wide.error) ? q("id,item_name,brand_type,uom") : wide;
+    };
+    const [itemsRes, brandsRes, vendorsRes, accountsRes, locationsRes] = await Promise.all([
+      loadItems(),
       sb.from("brands").select("id,brand_name").order("brand_name"),
       sb.from("vendors").select("id,vendor_name,gstin").order("vendor_name").limit(2000),
+      // the two reference tables are optional (missing until the migration runs) -> empty lists
+      sb.from("zoho_accounts").select("account_id,account_name,account_type").eq("is_active", true).in("account_type", ["cost_of_goods_sold", "expense", "other_expense"]).order("account_name"),
+      sb.from("zoho_tag_options").select("option_name").eq("tag_name", "Location").eq("option_active", true).order("option_name"),
     ]);
     const firstErr = itemsRes.error || brandsRes.error || vendorsRes.error;
     if (firstErr) return NextResponse.json({ error: firstErr.message }, { status: 500 });
     const catalog = itemsRes.data || [];
     const brands = brandsRes.data || [];
     const vendors = vendorsRes.data || [];
+    const accounts = accountsRes.error ? [] : accountsRes.data || [];
+    const locations = locationsRes.error ? [] : (locationsRes.data || []).map((r) => r.option_name);
 
     // 2. vendor resolution — GSTIN is the stable identifier; name matches are only
     //    suggestions. An explicit vendor_id (linked earlier / editing a saved bill) wins.
@@ -64,13 +75,19 @@ export async function POST(request) {
 
     // 3. this vendor's confirmed wording -> item mappings
     let mappingMap = new Map();
+    const vendorOverrides = {};
+    let vendorItemIds = []; // every item this vendor has been bought from before (for the picker)
     if (matched) {
-      const { data: maps, error: mErr } = await sb
-        .from("vendor_item_mappings")
-        .select("normalized_vendor_item_name,vendor_item_name,item_id")
-        .eq("vendor_id", matched.id);
+      const mq = (cols) => sb.from("vendor_item_mappings").select(cols).eq("vendor_id", matched.id);
+      let { data: maps, error: mErr } = await mq("normalized_vendor_item_name,vendor_item_name,item_id," + ZOHO_FIELD_COLS + ",brand_type");
+      if (isMissingColumn(mErr)) ({ data: maps, error: mErr } = await mq("normalized_vendor_item_name,vendor_item_name,item_id"));
       if (mErr) return NextResponse.json({ error: mErr.message }, { status: 500 });
       mappingMap = new Map((maps || []).map((m) => [m.normalized_vendor_item_name, m]));
+      vendorItemIds = [...new Set((maps || []).map((m) => m.item_id))];
+      for (const m of maps || []) {
+        const ov = { account_id: m.account_id, account_name: m.account_name, itc_eligibility: m.itc_eligibility, location: m.location, brand_type: m.brand_type };
+        if (Object.values(ov).some((v) => v != null && v !== "")) vendorOverrides[m.item_id] = ov;
+      }
     }
     const byNormName = new Map(catalog.map((c) => [norm(c.item_name), c]));
 
@@ -103,6 +120,10 @@ export async function POST(request) {
       items: catalog,
       resolved,
       suggestions,
+      vendor_overrides: vendorOverrides,
+      vendor_item_ids: vendorItemIds,
+      accounts,
+      locations,
     });
   } catch (err) {
     console.error("purchase-bills match failed:", err);

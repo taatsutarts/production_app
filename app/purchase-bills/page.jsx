@@ -1,9 +1,11 @@
 "use client";
 // Purchase Bills: upload (camera / image / PDF) -> preview -> Gemini extraction ->
 // vendor resolution (GSTIN match / name candidates / create) -> per-line standard
-// item + brand matching -> editable review -> save draft (Supabase + Drive) ->
+// item + brand matching -> editable review -> save draft (Supabase) ->
 // approve -> Zoho. One client file, same card/table styling as the rest of the app.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { lineDefaults } from "@/lib/purchaseMatch";
 
 const card = "rounded-2xl border border-slate-200 bg-white p-3 shadow-sm dark:border-slate-800 dark:bg-slate-900";
 const title = "text-base font-semibold";
@@ -41,7 +43,6 @@ const fm = (x) =>
     ? "—"
     : (x < 0 ? "−₹" : "₹") + Math.abs(r2(x)).toLocaleString("en-IN", { maximumFractionDigits: 2 });
 
-const DRIVE_C = { uploaded: "green", pending: "amber", failed: "rose", not_configured: "slate" };
 const ZOHO_C = { synced: "green", pending: "amber", failed: "rose", not_configured: "slate" };
 
 function Badge({ t = "slate", children }) {
@@ -78,12 +79,224 @@ const EMPTY_LINE = {
   item_id: "", // standard purchase_items row ("" = not resolved yet)
   brand_id: "", // brands row ("" = not resolved yet)
   match_how: "", // "" | "mapping" | "exact" — how the item suggestion was found
+  // Zoho bill-line fields — pre-filled from history (this vendor's exception, else the item default)
+  account_id: "",
+  account_name: "",
+  itc_eligibility: "", // "eligible" | "ineligible"
+  location: "",
   quantity: "",
   unit: "",
   rate: "",
   tax_rate: "",
   line_total: "",
 };
+
+/* ---------- searchable picker (type to filter) — used for the item and the account ---------- */
+
+// groups: [{ title, options: [{ value, label, hint? }] }]. The list opens in a portal with a fixed
+// position, so the line-items table's scroll box can never clip it. Every word typed must appear in
+// the option (any order); arrow keys + Enter pick; Escape closes.
+function SearchSelect({ testId, value, label, groups, onPick, placeholder, className, clearLabel }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const [hi, setHi] = useState(0);
+  const [pos, setPos] = useState(null);
+  const btnRef = useRef(null);
+  const popRef = useRef(null);
+  const inputRef = useRef(null);
+
+  const place = () => {
+    const r = btnRef.current && btnRef.current.getBoundingClientRect();
+    if (!r) return;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const width = Math.min(Math.max(r.width, 300), vw - 16);
+    const left = Math.max(8, Math.min(r.left, vw - width - 8));
+    const below = vh - r.bottom;
+    const up = below < 300 && r.top > below; // open upwards when there is more room above
+    setPos({
+      left,
+      width,
+      top: up ? undefined : r.bottom + 4,
+      bottom: up ? vh - r.top + 4 : undefined,
+      maxH: Math.max(180, Math.min(400, (up ? r.top : below) - 16)),
+    });
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    place();
+    const onMove = () => place();
+    const onDown = (e) => {
+      if ((popRef.current && popRef.current.contains(e.target)) || (btnRef.current && btnRef.current.contains(e.target))) return;
+      setOpen(false);
+    };
+    window.addEventListener("resize", onMove);
+    window.addEventListener("scroll", onMove, true);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("resize", onMove);
+      window.removeEventListener("scroll", onMove, true);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (open) {
+      setQ("");
+      setHi(0);
+      setTimeout(() => inputRef.current && inputRef.current.focus(), 0);
+    }
+  }, [open]);
+
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+  let budget = 150; // enough to scroll, never a wall of 900 rows
+  const shown = [];
+  for (const g of groups) {
+    const opts = [];
+    for (const o of g.options) {
+      if (budget <= 0) break;
+      if (words.every((w) => o.label.toLowerCase().includes(w))) {
+        opts.push(o);
+        budget--;
+      }
+    }
+    if (opts.length) shown.push({ title: g.title, options: opts });
+  }
+  const flat = shown.flatMap((g) => g.options);
+
+  useEffect(() => {
+    if (open && popRef.current) {
+      const el = popRef.current.querySelector('[data-hi="1"]');
+      if (el) el.scrollIntoView({ block: "nearest" });
+    }
+  }, [hi, open]);
+
+  const pick = (v) => {
+    onPick(v);
+    setOpen(false);
+    if (btnRef.current) btnRef.current.focus();
+  };
+  const onKey = (e) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setHi((h) => Math.min(flat.length - 1, h + 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setHi((h) => Math.max(0, h - 1));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (flat[hi]) pick(flat[hi].value);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setOpen(false);
+      if (btnRef.current) btnRef.current.focus();
+    } else if (e.key === "Tab") {
+      setOpen(false);
+    }
+  };
+
+  let idx = -1;
+  return (
+    <>
+      <button
+        ref={btnRef}
+        type="button"
+        data-test={testId}
+        data-value={value || ""}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className={`${className} flex items-center justify-between gap-2 text-left`}
+      >
+        <span className={`truncate ${label ? "" : "text-slate-400"}`}>{label || placeholder}</span>
+        <span aria-hidden="true" className="text-slate-400">▾</span>
+      </button>
+      {open &&
+        pos &&
+        createPortal(
+          <div
+            ref={popRef}
+            role="listbox"
+            style={{ position: "fixed", left: pos.left, width: pos.width, top: pos.top, bottom: pos.bottom, maxHeight: pos.maxH, zIndex: 70 }}
+            className="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl"
+          >
+            <input
+              ref={inputRef}
+              data-test={testId + "_search"}
+              value={q}
+              onChange={(e) => {
+                setQ(e.target.value);
+                setHi(0);
+              }}
+              onKeyDown={onKey}
+              placeholder="Type to search…"
+              className="w-full border-b border-slate-200 px-3 py-2 text-base outline-none"
+            />
+            <div className="overflow-y-auto">
+              {value && clearLabel && (
+                <button type="button" onClick={() => pick("")} className="w-full px-3 py-2 text-left text-sm text-rose-600 hover:bg-slate-50">
+                  ✕ {clearLabel}
+                </button>
+              )}
+              {shown.length === 0 && <div className="px-3 py-3 text-sm text-slate-500">No match for “{q}”.</div>}
+              {shown.map((g) => (
+                <div key={g.title}>
+                  <div className="bg-slate-50 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-500">{g.title}</div>
+                  {g.options.map((o) => {
+                    idx++;
+                    const me = idx;
+                    return (
+                      <button
+                        key={g.title + o.value}
+                        type="button"
+                        role="option"
+                        aria-selected={o.value === value}
+                        data-hi={me === hi ? "1" : undefined}
+                        onMouseEnter={() => setHi(me)}
+                        onClick={() => pick(o.value)}
+                        className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm ${me === hi ? "bg-slate-100" : ""} ${o.value === value ? "font-semibold" : ""}`}
+                      >
+                        <span>{o.label}</span>
+                        {o.hint && <span className="shrink-0 text-xs text-slate-400">{o.hint}</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          </div>,
+          document.body
+        )}
+    </>
+  );
+}
+
+/* ---------- Zoho line fields: defaults from history ---------- */
+
+// Most common location among the catalog items of one brand — used only when an item has no
+// location of its own (learned from the data, nothing hardcoded).
+function locationForBrand(catalogItems, brandName) {
+  if (!brandName) return "";
+  const n = {};
+  for (const it of catalogItems) if (it.brand_type === brandName && it.location) n[it.location] = (n[it.location] || 0) + 1;
+  return Object.entries(n).sort((a, b) => b[1] - a[1])[0]?.[0] || "";
+}
+
+// Fill account / ITC / location of a line from its item's defaults + this vendor's overrides.
+// force = overwrite what is there (the reviewer just picked a different item); otherwise only blanks.
+function withZohoDefaults(line, item, override, catalogItems, brandName, force = false) {
+  const d = lineDefaults(item, override);
+  const next = { ...line };
+  if (d.account_id && (force || !line.account_id)) {
+    next.account_id = d.account_id;
+    next.account_name = d.account_name;
+  }
+  if (d.itc_eligibility && (force || !line.itc_eligibility)) next.itc_eligibility = d.itc_eligibility;
+  const loc = d.location || locationForBrand(catalogItems, brandName);
+  if (loc && (force || !line.location)) next.location = loc;
+  return next;
+}
 
 /* ---------- upload size (Vercel rejects request bodies over 4.5 MB) ---------- */
 
@@ -123,6 +336,7 @@ export default function PurchaseBills() {
   const [file, setFile] = useState(null);
   const [fileKind, setFileKind] = useState(null); // "image" | "pdf"
   const [fileUrl, setFileUrl] = useState("");
+  const [storedFile, setStoredFile] = useState(null); // { name } — the original saved with the bill being edited
   const cameraRef = useRef(null);
   const imageRef = useRef(null);
   const pdfRef = useRef(null);
@@ -134,7 +348,7 @@ export default function PurchaseBills() {
   const [editingId, setEditingId] = useState(""); // set while editing a saved bill
 
   /* ---------- matching state (vendor + items + brands, all server-side) ---------- */
-  const [catalog, setCatalog] = useState({ items: [], brands: [] });
+  const [catalog, setCatalog] = useState({ items: [], brands: [], accounts: [], locations: [], vendorOv: {}, vendorItemIds: [] });
   const [vm, setVm] = useState({ checked: false, matched: null, candidates: [] }); // vendor match
   const [suggestions, setSuggestions] = useState({}); // line index -> [ { id, item_name, score } ]
   const [matchBusy, setMatchBusy] = useState(false);
@@ -176,6 +390,7 @@ export default function PurchaseBills() {
     if (!editingId) setBill(null); // a new file starts a fresh review — except while editing
     setItems([]);
     setFile(f);
+    setStoredFile(null);
     setFileKind(kind);
     setFileUrl(URL.createObjectURL(f));
   }
@@ -183,6 +398,7 @@ export default function PurchaseBills() {
   function clearForm() {
     if (fileUrl) URL.revokeObjectURL(fileUrl);
     setFile(null);
+    setStoredFile(null);
     setFileKind(null);
     setFileUrl("");
     setBill(null);
@@ -218,7 +434,14 @@ export default function PurchaseBills() {
         setErr(data.error || "Vendor/item matching failed.");
         return;
       }
-      setCatalog({ items: data.items || [], brands: data.brands || [] });
+      setCatalog({
+        items: data.items || [],
+        brands: data.brands || [],
+        accounts: data.accounts || [],
+        locations: data.locations || [],
+        vendorOv: data.vendor_overrides || {},
+        vendorItemIds: data.vendor_item_ids || [],
+      });
       const brandIdByName = {};
       (data.brands || []).forEach((b) => (brandIdByName[b.brand_name] = String(b.id)));
 
@@ -254,15 +477,20 @@ export default function PurchaseBills() {
           const item_id = it.item_id || (hit ? String(hit.item_id) : "");
           let brand_id = it.brand_id || "";
           const match_how = it.match_how || (hit ? hit.how : "");
+          const cat = item_id ? (data.items || []).find((c) => String(c.id) === String(item_id)) : null;
+          const ov = item_id ? (data.vendor_overrides || {})[item_id] : null;
           if (item_id && !brand_id) {
-            const cat = (data.items || []).find((c) => String(c.id) === String(item_id));
-            if (cat && (cat.brand_type === "Gourmaison" || cat.brand_type === "Taatsu")) {
-              brand_id = brandIdByName[cat.brand_type] || "";
+            // this vendor's own brand for the item wins, then the item's brand (when it has just one)
+            const bt = lineDefaults(cat, ov).brand_type;
+            if (bt === "Gourmaison" || bt === "Taatsu") {
+              brand_id = brandIdByName[bt] || "";
             } else if (brandIdByName[(it.cost_center || "").trim()]) {
               brand_id = brandIdByName[(it.cost_center || "").trim()];
             }
           }
-          return { ...it, item_id, brand_id, match_how };
+          const brandName = ((data.brands || []).find((b) => String(b.id) === String(brand_id)) || {}).brand_name || "";
+          const filled = cat ? withZohoDefaults(it, cat, ov, data.items || [], brandName) : it;
+          return { ...filled, item_id, brand_id, match_how };
         })
       );
     } catch (e) {
@@ -295,6 +523,7 @@ export default function PurchaseBills() {
         vendor_gstin: d.vendor_gstin || "",
         cost_center: d.cost_center || "",
         invoice_number: d.invoice_number || "",
+        grn_no: "", // internal tracking number (not sent to Zoho)
         invoice_date: d.invoice_date || "",
         due_date: d.due_date || "",
         discount_type: d.discount_type || "none",
@@ -339,9 +568,11 @@ export default function PurchaseBills() {
         return;
       }
       if (fileUrl) URL.revokeObjectURL(fileUrl);
-      setFile(null);
-      setFileKind(null);
-      setFileUrl("");
+      setFile(null); // no NEW file; the saved original (if there is one) is only displayed
+      // the saved original, read back from storage (cache-busted so a replaced file shows at once)
+      setFileKind(data.file ? data.file.kind : null);
+      setFileUrl(data.file ? data.file.url + "&t=" + Date.now() : "");
+      setStoredFile(data.file ? { name: data.file.name } : null);
       setEditingId(b.id);
       const draft = {
         vendor_id: (data.bill.vendor && data.bill.vendor.id) ? String(data.bill.vendor.id) : "",
@@ -349,6 +580,7 @@ export default function PurchaseBills() {
         vendor_gstin: data.bill.vendor_gstin || "",
         cost_center: data.bill.cost_center || "",
         invoice_number: data.bill.invoice_number || "",
+        grn_no: data.bill.grn_no || "",
         invoice_date: data.bill.invoice_date || "",
         due_date: data.bill.due_date || "",
         discount_type: data.bill.discount_type || "none",
@@ -364,6 +596,10 @@ export default function PurchaseBills() {
         cost_center: it.cost_center || "",
         item_id: it.item_id ? String(it.item_id) : it.item && it.item.id ? String(it.item.id) : "",
         brand_id: it.brand_id ? String(it.brand_id) : it.brand && it.brand.id ? String(it.brand.id) : "",
+        account_id: it.account_id ? String(it.account_id) : "",
+        account_name: it.account_name || "",
+        itc_eligibility: it.itc_eligibility || "",
+        location: it.location || "",
         quantity: it.quantity ?? "",
         unit: it.unit || "",
         rate: it.rate ?? "",
@@ -450,13 +686,13 @@ export default function PurchaseBills() {
     }
   }
 
-  /* ---------- save draft (Supabase + Drive) ---------- */
+  /* ---------- save draft (Supabase) ---------- */
   const brandNameOf = (id) => {
     const b = catalog.brands.find((x) => String(x.id) === String(id));
     return b ? b.brand_name : "";
   };
   // when every line agrees on one brand, that brand becomes the bill's cost center
-  // (reports / Drive folders) — otherwise keep whatever is already there
+  // (reports) — otherwise keep whatever is already there
   const uniformBrandName = () => {
     if (!items.length) return "";
     const first = items[0].brand_id;
@@ -470,7 +706,7 @@ export default function PurchaseBills() {
     setErr("");
     setMsg(editingId ? "Updating…" : "Saving…");
     try {
-      // the original file goes along as base64 so the server can upload it to Drive
+      // the original file goes along as base64 so the server can store it in Supabase Storage
       let filePayload = null;
       if (file) {
         const b64 = await new Promise((ok, bad) => {
@@ -507,8 +743,6 @@ export default function PurchaseBills() {
         else setMsg("Bill updated.");
       } else {
         if (data.warning) setMsg("Saved as draft — but: " + data.warning);
-        else if (data.bill && data.bill.drive_status === "not_configured")
-          setMsg("Saved as draft. Original not uploaded — Google Drive is not configured yet.");
         else setMsg("Saved as draft.");
       }
       clearForm(); // keeps the message above
@@ -627,19 +861,61 @@ export default function PurchaseBills() {
     setItems((arr) =>
       arr.map((it, j) => {
         if (j !== i) return it;
-        const next = { ...it, item_id: id, match_how: "" };
+        let next = { ...it, item_id: id, match_how: "" };
+        const cat = id ? catalog.items.find((c) => String(c.id) === String(id)) : null;
+        const ov = id ? catalog.vendorOv[id] : null;
         if (id && !it.brand_id) {
-          const cat = catalog.items.find((c) => String(c.id) === String(id));
-          const single = cat && (cat.brand_type === "Gourmaison" || cat.brand_type === "Taatsu") ? cat.brand_type : "";
+          const bt = lineDefaults(cat, ov).brand_type;
+          const single = bt === "Gourmaison" || bt === "Taatsu" ? bt : "";
           if (single) {
             const b = catalog.brands.find((x) => x.brand_name === single);
             if (b) next.brand_id = String(b.id);
           }
         }
+        // a freshly chosen item brings its own account / ITC / location (the reviewer can still change them)
+        if (cat) {
+          const brandName = (catalog.brands.find((x) => String(x.id) === String(next.brand_id)) || {}).brand_name || "";
+          next = withZohoDefaults(next, cat, ov, catalog.items, brandName, true);
+        }
         return next;
       })
     );
   }
+  // choosing an account keeps its id and name together (the id is what Zoho needs)
+  const pickAccount = (i, id) => {
+    const a = catalog.accounts.find((x) => String(x.account_id) === String(id));
+    setItems((arr) =>
+      arr.map((it, j) => (j === i ? { ...it, account_id: id, account_name: a ? a.account_name : "" } : it))
+    );
+  };
+  // option lists for the searchable pickers (built once per catalog, not per row)
+  const itemOptions = useMemo(
+    () => catalog.items.map((c) => ({ value: String(c.id), label: c.item_name })),
+    [catalog.items]
+  );
+  const accountOptions = useMemo(
+    () => catalog.accounts.map((a) => ({ value: String(a.account_id), label: a.account_name })),
+    [catalog.accounts]
+  );
+  const vendorItemSet = useMemo(() => new Set((catalog.vendorItemIds || []).map(String)), [catalog.vendorItemIds]);
+  // suggestions for this line first, then what this vendor has been bought from before, then everything
+  const itemGroupsFor = (i) => {
+    const sug = suggestions[i] || [];
+    const sugIds = new Set(sug.map((x) => String(x.id)));
+    const groups = [];
+    if (sug.length)
+      groups.push({
+        title: "Suggested for this line",
+        options: sug.map((x) => ({ value: String(x.id), label: x.item_name, hint: Math.round(x.score * 100) + "%" })),
+      });
+    const mine = itemOptions.filter((o) => vendorItemSet.has(o.value) && !sugIds.has(o.value));
+    if (mine.length) groups.push({ title: "Bought from this vendor before", options: mine });
+    groups.push({
+      title: "All items",
+      options: itemOptions.filter((o) => !vendorItemSet.has(o.value) && !sugIds.has(o.value)),
+    });
+    return groups;
+  };
   const addItem = () => setItems((arr) => [...arr, { ...EMPTY_LINE }]);
   const removeItem = (i) => setItems((arr) => arr.filter((_, j) => j !== i));
 
@@ -666,7 +942,10 @@ export default function PurchaseBills() {
 
   // submission gates: vendor resolved + every line has a standard item + brand
   const vendorOk = !!(bill && bill.vendor_id);
-  const unresolved = bill ? items.filter((it) => !it.item_id || !it.brand_id).length : 0;
+  const zohoOn = catalog.accounts.length > 0; // off until the SQL migration + import have run
+  const unresolved = bill
+    ? items.filter((it) => !it.item_id || !it.brand_id || (zohoOn && (!it.account_id || !it.itc_eligibility))).length
+    : 0;
   const canSave = !!(bill && vendorOk && unresolved === 0 && !saving);
 
   // saved-bills search (client-side over the already-loaded list)
@@ -674,7 +953,7 @@ export default function PurchaseBills() {
   const shownBills = bills.filter((b) => {
     if (billsStatus !== "all" && (b.status || "draft") !== billsStatus) return false;
     if (!billsTerm) return true;
-    return `${b.invoice_number || ""} ${b.vendor_name || ""} ${b.vendor_gstin || ""} ${b.cost_center || ""} ${b.status || ""}`
+    return `${b.invoice_number || ""} ${b.grn_no || ""} ${b.vendor_name || ""} ${b.vendor_gstin || ""} ${b.cost_center || ""} ${b.status || ""}`
       .toLowerCase()
       .includes(billsTerm);
   });
@@ -921,6 +1200,9 @@ export default function PurchaseBills() {
               <Field label="Invoice number">
                 <input data-test="invoice_number" className={inp} value={bill.invoice_number} onChange={(e) => setBillF("invoice_number", e.target.value)} />
               </Field>
+              <Field label="GRN No. (internal)">
+                <input data-test="grn_no" className={inp} value={bill.grn_no || ""} onChange={(e) => setBillF("grn_no", e.target.value)} placeholder="Goods receipt note number" />
+              </Field>
               <Field label="Invoice date">
                 <input data-test="invoice_date" type="date" className={inp} value={bill.invoice_date} onChange={(e) => setBillF("invoice_date", e.target.value)} />
               </Field>
@@ -959,6 +1241,48 @@ export default function PurchaseBills() {
               </Field>
             </div>
 
+          </section>
+
+          <section className={`${card} min-w-0 max-lg:order-3`}>
+            <h2 className={title}>Original invoice</h2>
+            <div className="mt-2 rounded-xl border border-slate-200 p-2 dark:border-slate-800">
+              {fileKind === "image" ? (
+                <img src={fileUrl} alt="Original invoice" className="mx-auto max-h-[75vh] rounded-lg" />
+              ) : fileKind === "pdf" ? (
+                <iframe src={fileUrl} title="Original invoice" className="h-[75vh] w-full rounded-lg bg-white" />
+              ) : (
+                <div className="p-6 text-center">
+                  <p className={mute}>
+                    {editingId
+                      ? "No original file is stored for this bill (it was saved before files were kept). Attach one below if you have it."
+                      : "The original appears here after extraction."}
+                  </p>
+                </div>
+              )}
+            </div>
+            {editingId && storedFile && (
+              <p className={`${mute} mt-2`} data-test="stored_file_note">
+                Saved original: {storedFile.name} ·{" "}
+                <a href={fileUrl} target="_blank" rel="noreferrer" className="text-sky-600 underline">
+                  open in a new tab ↗
+                </a>
+                . Attach a new image or PDF below only to replace it.
+              </p>
+            )}
+            {editingId && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button onClick={() => imageRef.current.click()} className={btnGhost}>
+                  🖼️ Attach image
+                </button>
+                <button onClick={() => pdfRef.current.click()} className={btnGhost}>
+                  📄 Attach PDF
+                </button>
+              </div>
+            )}
+          </section>
+
+          {/* line items: full width on wide screens (13 columns need the room), under the details on phones */}
+          <section className={`${card} min-w-0 lg:col-span-2 max-lg:order-2`}>
             {/* line items */}
             <h3 className={`${title} mt-4`}>Line items</h3>
             {unresolved > 0 && (
@@ -967,7 +1291,7 @@ export default function PurchaseBills() {
                 data-test="unresolved_lines"
               >
                 ⚠️ {unresolved} line{unresolved > 1 ? "s" : ""} still need{unresolved > 1 ? "" : "s"} a standard
-                item and/or a brand before saving.
+                item, brand{zohoOn ? ", account and ITC" : ""} before saving.
               </div>
             )}
             <div className="mt-1 overflow-x-auto">
@@ -977,6 +1301,9 @@ export default function PurchaseBills() {
                     <th className={th}>Invoice wording</th>
                     <th className={th}>Standard item</th>
                     <th className={th}>Brand</th>
+                    {zohoOn && <th className={th}>Account</th>}
+                    {zohoOn && <th className={th}>ITC</th>}
+                    {zohoOn && <th className={th}>Location</th>}
                     <th className={th}>Qty</th>
                     <th className={th}>Unit</th>
                     <th className={th}>Rate</th>
@@ -990,6 +1317,8 @@ export default function PurchaseBills() {
                   {items.map((it, i) => {
                     const needItem = !it.item_id;
                     const needBrand = !it.brand_id;
+                    const needAcct = zohoOn && !it.account_id;
+                    const needItc = zohoOn && !it.itc_eligibility;
                     const known = catalog.items.find((c) => String(c.id) === String(it.item_id));
                     return (
                       <tr
@@ -1006,33 +1335,16 @@ export default function PurchaseBills() {
                           />
                         </td>
                         <td className={`${ltd} max-md:col-span-2`} data-label="Standard item">
-                          <select
-                            data-test={"item_item_" + i}
+                          <SearchSelect
+                            testId={"item_item_" + i}
                             className={(needItem ? tinWarn : tin) + " w-[260px] max-md:w-full"}
+                            placeholder="— choose item —"
+                            clearLabel="Clear item"
                             value={String(it.item_id || "")}
-                            onChange={(e) => pickItem(i, e.target.value)}
-                          >
-                            <option value="">— choose item —</option>
-                            {(suggestions[i] || []).length > 0 && (
-                              <optgroup label="Suggested for this line">
-                                {(suggestions[i] || []).map((s) => (
-                                  <option key={"sug_" + s.id} value={String(s.id)}>
-                                    {s.item_name} ({Math.round(s.score * 100)}%)
-                                  </option>
-                                ))}
-                              </optgroup>
-                            )}
-                            <optgroup label="All items">
-                              {catalog.items.map((c) => (
-                                <option key={c.id} value={String(c.id)}>
-                                  {c.item_name}
-                                </option>
-                              ))}
-                            </optgroup>
-                            {it.item_id && !known && (
-                              <option value={String(it.item_id)}>{it.item_name || "(item " + it.item_id + ")"}</option>
-                            )}
-                          </select>
+                            label={known ? known.item_name : it.item_id ? it.item_name || "(item " + it.item_id + ")" : ""}
+                            groups={itemGroupsFor(i)}
+                            onPick={(id) => pickItem(i, id)}
+                          />
                           {it.match_how === "mapping" && (
                             <div className="mt-0.5 text-xs text-emerald-600" data-test={"item_how_" + i}>
                               ✓ this vendor&apos;s saved mapping
@@ -1061,6 +1373,51 @@ export default function PurchaseBills() {
                           {needItem && <div className="mt-0.5 text-xs text-amber-700">item?</div>}
                           {needBrand && !needItem && <div className="mt-0.5 text-xs text-amber-700">brand?</div>}
                         </td>
+                        {zohoOn && (
+                          <td className={`${ltd} max-md:col-span-2`} data-label="Account (Zoho)">
+                            <SearchSelect
+                              testId={"item_acct_" + i}
+                              className={(needAcct ? tinWarn : tin) + " w-52 max-md:w-full"}
+                              placeholder="— account —"
+                              value={String(it.account_id || "")}
+                              label={(catalog.accounts.find((a) => String(a.account_id) === String(it.account_id)) || {}).account_name || it.account_name || (it.account_id ? "(account " + it.account_id + ")" : "")}
+                              groups={[{ title: "Zoho accounts", options: accountOptions }]}
+                              onPick={(id) => pickAccount(i, id)}
+                            />
+                          </td>
+                        )}
+                        {zohoOn && (
+                          <td className={ltd} data-label="ITC">
+                            <select
+                              data-test={"item_itc_" + i}
+                              className={(needItc ? tinWarn : tin) + " w-32 max-md:w-full"}
+                              value={it.itc_eligibility || ""}
+                              onChange={(e) => setItem(i, "itc_eligibility", e.target.value)}
+                            >
+                              <option value="">— ITC —</option>
+                              <option value="eligible">eligible</option>
+                              <option value="ineligible">ineligible</option>
+                            </select>
+                          </td>
+                        )}
+                        {zohoOn && (
+                          <td className={ltd} data-label="Location (Zoho tag)">
+                            <select
+                              data-test={"item_loc_" + i}
+                              className={tin + " w-36 max-md:w-full"}
+                              value={it.location || ""}
+                              onChange={(e) => setItem(i, "location", e.target.value)}
+                            >
+                              <option value="">— location —</option>
+                              {catalog.locations.map((l) => (
+                                <option key={l} value={l}>
+                                  {l}
+                                </option>
+                              ))}
+                              {it.location && !catalog.locations.includes(it.location) && <option value={it.location}>{it.location}</option>}
+                            </select>
+                          </td>
+                        )}
                         <td className={ltd} data-label="Qty">
                           <input
                             data-test={"item_qty_" + i}
@@ -1180,44 +1537,12 @@ export default function PurchaseBills() {
             {bill && (!vendorOk || unresolved > 0) && (
               <p className="mt-1 text-xs font-medium text-amber-700" data-test="save_blockers">
                 {!vendorOk && "Resolve the vendor above (match, pick a candidate, or create one). "}
-                {unresolved > 0 && unresolved + " line(s) still need a standard item and/or brand."}
+                {unresolved > 0 && unresolved + " line(s) still need a standard item, brand" + (zohoOn ? ", account and ITC" : "") + "."}
               </p>
             )}
             <p className={`${mute} mt-2`}>
               Nothing is submitted automatically — review, save as draft, then approve from the list below.
             </p>
-          </section>
-
-          <section className={`${card} min-w-0`}>
-            <h2 className={title}>Original invoice</h2>
-            <div className="mt-2 rounded-xl border border-slate-200 p-2 dark:border-slate-800">
-              {fileKind === "image" ? (
-                <img src={fileUrl} alt="Original invoice" className="mx-auto max-h-[75vh] rounded-lg" />
-              ) : fileKind === "pdf" ? (
-                <iframe src={fileUrl} title="Original invoice" className="h-[75vh] w-full rounded-lg bg-white" />
-              ) : (
-                <div className="p-6 text-center">
-                  <p className={mute}>
-                    {editingId ? "No new file attached for this edit." : "The original appears here after extraction."}
-                  </p>
-                  {editingId && bill.drive_file_link && (
-                    <a href={bill.drive_file_link} target="_blank" rel="noreferrer" className="mt-2 inline-block text-sm text-sky-600 underline">
-                      Open original in Drive ↗
-                    </a>
-                  )}
-                </div>
-              )}
-            </div>
-            {editingId && (
-              <div className="mt-2 flex flex-wrap gap-2">
-                <button onClick={() => imageRef.current.click()} className={btnGhost}>
-                  🖼️ Attach image
-                </button>
-                <button onClick={() => pdfRef.current.click()} className={btnGhost}>
-                  📄 Attach PDF
-                </button>
-              </div>
-            )}
           </section>
         </div>
       )}
@@ -1255,10 +1580,10 @@ export default function PurchaseBills() {
               <tr>
                 <th className={th}>Vendor</th>
                 <th className={th}>Invoice</th>
+                <th className={th}>GRN No.</th>
                 <th className={th}>Date</th>
                 <th className={th}>Grand total</th>
                 <th className={th}>Status</th>
-                <th className={th}>Drive</th>
                 <th className={th}>Zoho</th>
                 <th className={th}>Actions</th>
               </tr>
@@ -1274,19 +1599,13 @@ export default function PurchaseBills() {
                     {b.invoice_number || "—"}
                     <div className="text-xs text-slate-400">{b.vendor_gstin || ""}</div>
                   </td>
+                  <td className={td} data-test="bill_grn">
+                    {b.grn_no ? b.grn_no : <span className="text-xs text-amber-600">no GRN</span>}
+                  </td>
                   <td className={td}>{b.invoice_date || "—"}</td>
                   <td className={td}>{fm(b.computed_total)}</td>
                   <td className={td}>
                     <Badge t={b.status === "approved" ? "green" : "slate"}>{b.status}</Badge>
-                  </td>
-                  <td className={td}>
-                    <Badge t={DRIVE_C[b.drive_status] || "slate"}>{b.drive_status}</Badge>
-                    {b.drive_file_link && (
-                      <a href={b.drive_file_link} target="_blank" rel="noreferrer" className="ml-1 text-xs text-sky-600 underline">
-                        file
-                      </a>
-                    )}
-                    {b.drive_error && <div className="text-xs text-rose-500">{b.drive_error.slice(0, 80)}</div>}
                   </td>
                   <td className={td}>
                     <Badge t={ZOHO_C[b.zoho_sync_status] || "slate"}>{b.zoho_sync_status}</Badge>
