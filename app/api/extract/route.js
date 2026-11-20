@@ -15,15 +15,20 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// only 2 models, so failed tries don't use up your free quota
-// const MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
-const MODELS = ["gemini-flash-latest", "gemini-3.5-flash-lite"];
+// Pinned, stable models. NOT the "-latest" aliases or the newest previews: on the free tier those
+// hang or answer 503 under load (gemini-flash-latest / gemini-3.8-flash did, 2026-11-20), and a
+// hung call used to block the whole request until the host killed it. Each try is also cut
+// off after ATTEMPT_MS, so a stuck model falls through to the next one instead.
+const MODELS = ["gemini-3.5-flash", "gemini-3.1-flash-lite"];
+const ATTEMPT_MS = 20000; // 2 tries x 20 s fits the 60 s function limit
 const OPENING_CATEGORIES = ["TARTS"]; // add "MINIS" if wanted
 
 // sends photo + instructions to Gemini; tries the next model if one fails
 async function ask(prompt, mimeType, base64) {
   let lastError;
   for (const model of MODELS) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), ATTEMPT_MS);
     try {
       console.log("trying " + model);
       const response = await ai.models.generateContent({
@@ -32,12 +37,15 @@ async function ask(prompt, mimeType, base64) {
           { inlineData: { mimeType, data: base64 } },
           { text: prompt },
         ],
-        config: { responseMimeType: "application/json" },
+        config: { responseMimeType: "application/json", abortSignal: ctl.signal },
       });
       return JSON.parse(response.text);
     } catch (err) {
-      console.log(model + " failed: " + err.message);
-      lastError = err;
+      const timedOut = ctl.signal.aborted;
+      console.log(model + (timedOut ? " timed out after " + ATTEMPT_MS / 1000 + "s" : " failed: " + err.message));
+      lastError = timedOut ? new Error("Gemini took too long to answer (over " + ATTEMPT_MS / 1000 + " s). Try again.") : err;
+    } finally {
+      clearTimeout(timer);
     }
   }
   throw lastError;

@@ -15,8 +15,12 @@ export const maxDuration = 60;
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// same two models as /api/extract, so failed tries don't use up the free quota
-const MODELS = ["gemini-flash-latest", "gemini-3.5-flash-lite"];
+// Pinned, stable models. NOT the "-latest" aliases or the newest previews: on the free tier those
+// hang or answer 503 under load (gemini-flash-latest / gemini-3.8-flash did, 2026-11-20), and a
+// hung call used to block the whole request until the host killed it. Each try is also cut
+// off after ATTEMPT_MS, so a stuck model falls through to the next one instead.
+const MODELS = ["gemini-3.5-flash", "gemini-3.1-flash-lite"];
+const ATTEMPT_MS = 20000; // 2 tries x 20 s fits the 60 s function limit
 
 // The company's cost centers (brands) live in the `brands` table — no brand names
 // hardcoded in code. Gemini suggests which brand each LINE belongs to by comparing
@@ -57,22 +61,30 @@ class ExtractError extends Error {}
 async function ask(mimeType, base64, prompt) {
   let lastError;
   for (const model of MODELS) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), ATTEMPT_MS);
     try {
       console.log("purchase-bills: trying " + model);
       const response = await ai.models.generateContent({
         model,
         contents: [{ inlineData: { mimeType, data: base64 } }, { text: prompt }],
-        config: { responseMimeType: "application/json" },
+        config: { responseMimeType: "application/json", abortSignal: ctl.signal },
       });
       return JSON.parse(response.text);
     } catch (err) {
-      console.log(model + " failed: " + err.message);
-      lastError = err;
+      const timedOut = ctl.signal.aborted;
+      console.log(model + (timedOut ? " timed out after " + ATTEMPT_MS / 1000 + "s" : " failed: " + err.message));
+      lastError = timedOut ? new Error("TIMEOUT") : err;
+    } finally {
+      clearTimeout(timer);
     }
   }
   const m = String((lastError && lastError.message) || lastError);
   if (/429|RESOURCE_EXHAUSTED|quota/i.test(m)) {
     throw new ExtractError("Gemini quota is used up (429). Wait a minute and try again.");
+  }
+  if (/TIMEOUT/.test(m)) {
+    throw new ExtractError("Gemini took too long to answer (over " + ATTEMPT_MS / 1000 + " s). Try again.");
   }
   if (/503|UNAVAILABLE|overload/i.test(m)) {
     throw new ExtractError("Gemini is overloaded right now (503). Try again in a few minutes.");
