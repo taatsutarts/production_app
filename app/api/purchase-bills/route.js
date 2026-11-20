@@ -5,7 +5,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 import { uploadOriginal } from "@/lib/drive";
-import { saveBillOriginal } from "@/lib/storage";
+import { saveBillOriginal, relocateBillOriginal } from "@/lib/storage";
 import { syncBill } from "@/lib/zoho";
 import { norm } from "@/lib/purchaseMatch";
 
@@ -227,7 +227,7 @@ export async function POST(request) {
     //    warning instead (and Drive below stays an optional second copy).
     let storageError = "";
     if (file) {
-      const st = await saveBillOriginal({ billId: saved.id, file });
+      const st = await saveBillOriginal({ file, bill: saved });
       if (st.ok) {
         const { error: spErr } = await sb
           .from("purchase_bills")
@@ -380,9 +380,28 @@ export async function PUT(request) {
     // optional: a (new) original file -> store it for the Zoho sync first (the
     // stored copy is what the sync attaches; upsert:true replaces an older copy),
     // then the Drive upload as before
+    // Files live at <year>/<Month>/<Vendor>/<Invoice>.<ext>, so an edit of the
+    // vendor / invoice number / date without a new file MOVES the stored copy.
     let storageError = "";
+    const placed = {
+      vendor_name: bill.vendor_name || null,
+      invoice_number: bill.invoice_number || null,
+      invoice_date: bill.invoice_date || null,
+    };
+    if (!file && existing.storage_path) {
+      const mv = await relocateBillOriginal(existing.storage_path, placed);
+      if (!mv.ok) {
+        storageError = "the invoice original could not be moved to its new folder: " + mv.error;
+      } else if (mv.moved) {
+        const { error: spErr } = await sb
+          .from("purchase_bills")
+          .update({ storage_path: mv.path })
+          .eq("id", id);
+        if (spErr) storageError = "the invoice original was moved but the bill could not record it: " + spErr.message;
+      }
+    }
     if (file) {
-      const st = await saveBillOriginal({ billId: id, file });
+      const st = await saveBillOriginal({ file, bill: placed, oldPath: existing.storage_path });
       if (st.ok) {
         const { error: spErr } = await sb
           .from("purchase_bills")

@@ -31,11 +31,14 @@ function EyeIcon({ off }) {
   )
 }
 
+
 export default function LoginPage() {
   const router = useRouter()
   const supabase = createClient()
 
-  const [mode, setMode] = useState('login') // 'login' | 'signup'
+  // accounts are created by the admin in Supabase (Authentication -> Users):
+  // no self sign-up — store logins only see their own outlet
+  const [role, setRole] = useState('admin') // 'admin' | 'store' — who is logging in
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
@@ -43,61 +46,43 @@ export default function LoginPage() {
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
 
-  const isLogin = mode === 'login'
-
-  function switchMode() {
-    setMode(isLogin ? 'signup' : 'login')
-    setError('')
-    setMessage('')
-  }
-
   async function handleSubmit(e) {
     e.preventDefault()
     setLoading(true)
     setError('')
     setMessage('')
 
-    if (isLogin) {
-      const { error } = await supabase.auth.signInWithPassword({ email, password })
-      if (error) {
-        setError(error.message)
-        setLoading(false)
-        return
-      }
-      setMessage('Logged in! Redirecting...')
-      router.push('/')
-      router.refresh()
-      return
-    }
-
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters.')
-      setLoading(false)
-      return
-    }
-
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: { emailRedirectTo: window.location.origin },
-    })
-
+    const { error } = await supabase.auth.signInWithPassword({ email, password })
     if (error) {
       setError(error.message)
       setLoading(false)
       return
     }
-
-    if (data.session) {
-      // email confirmation is off, so the user is already logged in
-      setMessage('Account created! Redirecting...')
-      router.push('/')
-      router.refresh()
-    } else {
-      // email confirmation is on
-      setMessage('Account created. Check your email to confirm, then log in.')
+    // the chosen role must match the account's real role (user_profiles); a store
+    // login can't enter as admin and the other way round. Table missing (migration
+    // not run yet) = old behaviour, everyone is admin.
+    const { data: u } = await supabase.auth.getUser()
+    const { data: prof, error: profErr } = await supabase
+      .from('user_profiles')
+      .select('role')
+      .eq('user_id', u?.user?.id)
+      .maybeSingle()
+    const actual = profErr?.code === 'PGRST205' ? 'admin' : prof?.role
+    if (actual !== role) {
+      await supabase.auth.signOut()
+      setError(
+        !actual
+          ? 'This account has no access yet. Ask the admin to set it up.'
+          : actual === 'admin'
+            ? 'This is an admin account. Choose "Admin" to log in.'
+            : 'This is a store account. Choose "Store" to log in.'
+      )
       setLoading(false)
+      return
     }
+    setMessage('Logged in! Redirecting...')
+    router.push(actual === 'store' ? '/store' : '/')
+    router.refresh()
   }
 
   return (
@@ -108,11 +93,31 @@ export default function LoginPage() {
       >
         <div>
           <h1 className="text-2xl font-bold text-gray-900">
-            {isLogin ? 'Welcome back Taatsu' : 'Create your account'}
+            Welcome back Taatsu
           </h1>
           <p className="mt-1 text-sm text-gray-500">
-            {isLogin ? 'Log in to continue' : 'Sign up with your email and a password'}
+            Log in as {role === 'admin' ? 'admin' : 'a store'} to continue
           </p>
+        </div>
+
+        <div role="radiogroup" aria-label="Log in as" className="grid grid-cols-2 gap-1 rounded-lg bg-gray-100 p-1">
+          {[['admin', 'Admin'], ['store', 'Store']].map(([v, label]) => (
+            <button
+              key={v}
+              type="button"
+              role="radio"
+              aria-checked={role === v}
+              onClick={() => {
+                setRole(v)
+                setError('')
+              }}
+              className={`rounded-md px-3 py-2 text-sm font-semibold transition ${
+                role === v ? 'bg-black text-white shadow' : 'text-gray-600 hover:text-gray-900'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
 
         <div>
@@ -143,7 +148,7 @@ export default function LoginPage() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
-              autoComplete={isLogin ? 'current-password' : 'new-password'}
+              autoComplete="current-password"
               className="w-full rounded-lg border border-gray-300 bg-white py-2.5 pl-3 pr-11 text-gray-900 outline-none focus:border-black focus:ring-1 focus:ring-black"
             />
             <button
@@ -169,19 +174,9 @@ export default function LoginPage() {
           disabled={loading}
           className="rounded-lg bg-black px-3 py-2.5 font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          {loading ? 'Please wait...' : isLogin ? 'Log in' : 'Create account'}
+          {loading ? 'Please wait...' : 'Log in'}
         </button>
 
-        <p className="text-center text-sm text-gray-600">
-          {isLogin ? "Don't have an account? " : 'Already have an account? '}
-          <button
-            type="button"
-            onClick={switchMode}
-            className="font-semibold text-blue-600 hover:underline"
-          >
-            {isLogin ? 'Create one' : 'Log in'}
-          </button>
-        </p>
       </form>
     </main>
   )

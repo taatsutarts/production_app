@@ -6,9 +6,10 @@ const fmt = (n) => String(Math.round(n * 100) / 100);
 const pos = (n) => Math.max(n, 0); // negative stock counts as 0 in percentages
 const red = (n) => (n < 0 ? "text-red-600" : "");
 
-export default function ByOutletView({ stock, warnings }) {
+// lockOutlet: a store login — only that outlet, no outlet picker
+export default function ByOutletView({ stock, warnings, lockOutlet = null }) {
   const [section, setSection] = useState("Tarts");
-  const [outlet, setOutlet] = useState("All");
+  const [outlet, setOutlet] = useState(lockOutlet || "All");
 
   if (stock.length === 0) {
     return <p className="mt-6 text-slate-500">No stock data found.</p>;
@@ -86,6 +87,7 @@ export default function ByOutletView({ stock, warnings }) {
           </button>
         ))}
 
+        {!lockOutlet && (
         <select
           value={outlet}
           onChange={(e) => setOutlet(e.target.value)}
@@ -98,6 +100,7 @@ export default function ByOutletView({ stock, warnings }) {
             </option>
           ))}
         </select>
+        )}
       </div>
 
       {/* All outlets: items x outlets table */}
@@ -176,7 +179,9 @@ export default function ByOutletView({ stock, warnings }) {
                   <th className="px-4 py-2">Item</th>
                   <th className="px-4 py-2 text-right">Stock</th>
                   <th className="px-4 py-2">% of this outlet's {active.toLowerCase()}</th>
-                  <th className="whitespace-nowrap px-4 py-2 text-right">% of all outlets</th>
+                  {!lockOutlet && (
+                    <th className="whitespace-nowrap px-4 py-2 text-right">% of all outlets</th>
+                  )}
                 </tr>
               </thead>
               <tbody>
@@ -204,7 +209,7 @@ export default function ByOutletView({ stock, warnings }) {
                           <span className="w-12 text-right">{pct.toFixed(1)}%</span>
                         </div>
                       </td>
-                      <td className="px-4 py-2 text-right">{share.toFixed(1)}%</td>
+                      {!lockOutlet && <td className="px-4 py-2 text-right">{share.toFixed(1)}%</td>}
                     </tr>
                   );
                 })}

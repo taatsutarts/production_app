@@ -1,5 +1,6 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse } from 'next/server'
+import { NO_ACCESS_PATH, STORE_HOME, storeMayOpen } from '@/lib/access'
 
 // Pages that logged-out visitors are allowed to see
 const PUBLIC_PATHS = ['/login']
@@ -64,14 +65,54 @@ export async function proxy(request) {
     return NextResponse.redirect(url)
   }
 
+  if (!user) return response // public page, logged out
+
   // Already logged in and visiting /login -> send to the app
-  if (user && pathname.startsWith('/login')) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/'
-    return NextResponse.redirect(url)
+  if (pathname.startsWith('/login')) return redirectTo(request, '/')
+
+  // Role check (user_profiles; the login may read its own row). Stores only reach
+  // their pages — and NO /api route, because those use the service key and
+  // would ignore the per-outlet database rules.
+  const { data: profile, error: profileErr } = await supabase
+    .from('user_profiles')
+    .select('role, outlet_id, outlets(name)')
+    .eq('user_id', user.id)
+    .maybeSingle()
+
+  // table not created yet (supabase_migration_store_users.sql not run): keep the
+  // old behaviour — the only logins that exist are the owner's
+  if (profileErr?.code === 'PGRST205') return response
+
+  // admin: the whole app, except /store/* (those pages need a store's outlet)
+  if (profile?.role === 'admin') {
+    return storeMayOpen(pathname) ? redirectTo(request, '/', response) : response
   }
 
-  return response
+  // store: the /store area only; every /api route is closed (service key, no RLS)
+  if (profile?.role === 'store') {
+    if (pathname.startsWith('/api')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+    if (!storeMayOpen(pathname)) return redirectTo(request, STORE_HOME, response)
+    return response
+  }
+
+  // logged in but no role yet
+  if (pathname === NO_ACCESS_PATH) return response
+  if (pathname.startsWith('/api')) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+  return redirectTo(request, NO_ACCESS_PATH, response)
+}
+
+// redirect that keeps any refreshed session cookies
+function redirectTo(request, path, from) {
+  const url = request.nextUrl.clone()
+  url.pathname = path
+  url.search = ''
+  const res = NextResponse.redirect(url)
+  if (from) from.cookies.getAll().forEach((c) => res.cookies.set(c))
+  return res
 }
 
 export const config = {

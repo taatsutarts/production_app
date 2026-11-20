@@ -5,6 +5,7 @@ import { useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
+import { menuFor } from "@/lib/access"; // the page registry: add pages there
 
 /* ---------- minimal icon set (24x24, stroke) ---------- */
 const ICONS = {
@@ -156,55 +157,9 @@ function Icon({ name, className = "h-[18px] w-[18px] shrink-0" }) {
   );
 }
 
-const NAV = [
-  { href: "/", label: "Home", icon: "home" },
-  { href: "/gourmaison/shopify-orders", label: "Shopify Orders", icon: "cart" },
-  { href: "/production", label: "Production Import", icon: "factory" },
-  { href: "/items", label: "Items", icon: "list" },
-  { href: "/vendors", label: "Vendors", icon: "users" },
-  { href: "/purchase-items", label: "Purchase Items", icon: "package" },
-  { href: "/purchase-bills", label: "Purchase Bills", icon: "receipt" },
-  { href: "/outlets", label: "Outlets", icon: "store" },
-  { href: "/daily-stock-report", label: "Daily Stock Report", icon: "chart" },
-  { href: "/daily-production", label: "Daily Production", icon: "calendar" },
-  { href: "/spoilage", label: "Spoilages", icon: "trash" },
-  { href: "/totals", label: "CK Closing Stock", icon: "calculator" },
-  { href: "/trends", label: "Production Trends", icon: "trendUp" },
-  {
-    label: "Outlets Current Stock",
-    icon: "warehouse",
-    base: "/Kytchens_current_stock",
-    children: [
-      { href: "/Kytchens_current_stock/sheet", label: "Current Stock (Sheet)" },
-      { href: "/Kytchens_current_stock/by-outlet", label: "Stock by Outlet" },
-    ],
-  },
-  {
-    label: "Shipment Planning",
-    icon: "send",
-    base: "/shipment-planning",
-    children: [
-      { href: "/shipment-planning/planner", label: "Planner" },
-      { href: "/shipment-planning/closing-stock", label: "Outlet Closing Stock" },
-      { href: "/shipment-planning/po-send", label: "Send PO" },
-      { href: "/shipment-planning/trend", label: "Outlet Stock Trend" },
-      // { href: "/shipment-planning/plan", label: "Plan Shipment" },
-    ],
-  },
-  { href: "/dispatches", label: "Dispatches", icon: "truck" },
-  { href: "/dispatch_tracker", label: "Dispatch Tracker", icon: "pin" },
-  {
-    label: "Supplies Dispatches",
-    icon: "boxes",
-    base: "/dispatch",
-    children: [
-      { href: "/dispatch/challan", label: "Generage Supplies Challan" },
-      { href: "/dispatch/requirement", label: "Supplies Monthly Req" },
-    ],
-  },
-];
-
-export default function Sidebar() {
+export default function Sidebar({ profile }) {
+  const isStore = profile?.role === "store";
+  const nav = menuFor(profile?.role);
   const pathname = usePathname();
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -220,8 +175,9 @@ export default function Sidebar() {
     router.refresh();
   }
 
+  // Home links ("/" admin, "/store" store) match exactly; every other link matches its subpages too
   const isActive = (href) =>
-    href === "/" ? pathname === "/" : pathname.startsWith(href);
+    href === "/" || href === "/store" ? pathname === href : pathname.startsWith(href);
 
   const linkClass = (active) =>
     `flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
@@ -257,11 +213,13 @@ export default function Sidebar() {
       >
         <div className="border-b border-slate-800 px-6 py-5">
           <p className="text-lg font-bold tracking-widest text-white">TAATSU</p>
-          <p className="text-xs text-slate-400">Production & Shipment</p>
+          <p className="text-xs text-slate-400">
+            {isStore ? `${profile.outletName || "Store"} store` : "Production & Shipment"}
+          </p>
         </div>
 
         <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
-          {NAV.map((item) => {
+          {nav.map((item) => {
             if (!item.children) {
               return (
                 <Link
