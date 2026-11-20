@@ -10,6 +10,8 @@ const title = "text-base font-semibold";
 const mute = "text-sm text-slate-500 dark:text-slate-400";
 const th = "px-2 py-1.5 text-left text-sm font-medium text-slate-500 dark:text-slate-400";
 const td = "px-2 py-1.5";
+// line-item cells: on phones each line becomes a card and every cell stacks under its small label (data-label)
+const ltd = td + " max-md:block max-md:px-0 max-md:py-0 max-md:before:mb-0.5 max-md:before:block max-md:before:text-xs max-md:before:font-medium max-md:before:text-slate-500 max-md:before:content-[attr(data-label)]";
 const inp =
   "w-full rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-800";
 // Line-item inputs are bigger than the header fields — this is where people actually
@@ -83,6 +85,39 @@ const EMPTY_LINE = {
   line_total: "",
 };
 
+/* ---------- upload size (Vercel rejects request bodies over 4.5 MB) ---------- */
+
+// the save request carries the file as base64 (+33%), so the raw file must stay under ~3.2 MB
+const MAX_FILE_BYTES = 3.2 * 1024 * 1024;
+
+// Phone photos are 3-8 MB; the invoice is just as readable at 2000 px / JPEG 85%
+// (usually 300-800 KB). PDFs and anything that fails to decode are returned unchanged.
+async function shrinkImage(f) {
+  if (!f.type.startsWith("image/") || f.size < 600 * 1024) return f;
+  try {
+    const bmp = await createImageBitmap(f);
+    const scale = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(bmp.width * scale);
+    canvas.height = Math.round(bmp.height * scale);
+    canvas.getContext("2d").drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    bmp.close?.();
+    const blob = await new Promise((ok) => canvas.toBlob(ok, "image/jpeg", 0.85));
+    if (!blob || blob.size >= f.size) return f;
+    return new File([blob], f.name.replace(/.[^.]+$/, "") + ".jpg", { type: "image/jpeg" });
+  } catch {
+    return f;
+  }
+}
+
+// a failed response is not always JSON (a platform error page is plain text): say what happened
+function httpProblem(res, data, what) {
+  if (data && (data.message || data.error)) return data.message || data.error;
+  if (res.status === 413)
+    return what + " failed: the file is too large for the server (limit about 4 MB). Use a smaller photo or PDF.";
+  return what + " failed (HTTP " + res.status + ").";
+}
+
 export default function PurchaseBills() {
   /* ---------- upload state ---------- */
   const [file, setFile] = useState(null);
@@ -119,12 +154,20 @@ export default function PurchaseBills() {
   const [err, setErr] = useState("");
 
   /* ---------- pick / remove / replace a file ---------- */
-  function onPick(f) {
-    if (!f) return;
+  async function onPick(picked) {
+    if (!picked) return;
+    const f = await shrinkImage(picked);
     const kind =
       f.type === "application/pdf" ? "pdf" : f.type && f.type.startsWith("image/") ? "image" : null;
     if (!kind) {
       setErr("Please choose an image or a PDF.");
+      return;
+    }
+    if (f.size > MAX_FILE_BYTES) {
+      setErr(
+        "This file is " + (f.size / 1048576).toFixed(1) + " MB — too large to upload (limit about 3 MB). " +
+          (kind === "pdf" ? "Compress the PDF or send a photo of the invoice instead." : "Choose a smaller photo.")
+      );
       return;
     }
     if (fileUrl) URL.revokeObjectURL(fileUrl);
@@ -241,7 +284,7 @@ export default function PurchaseBills() {
       const res = await fetch("/api/purchase-bills/extract", { method: "POST", body: fd });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setErr(data.error || "Extraction failed (" + res.status + ").");
+        setErr(httpProblem(res, data, "Extraction"));
         setMsg("");
         return;
       }
@@ -455,7 +498,7 @@ export default function PurchaseBills() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setErr(data.message || data.error || "Save failed.");
+        setErr(httpProblem(res, data, "Save"));
         setMsg("");
         return;
       }
@@ -738,8 +781,8 @@ export default function PurchaseBills() {
 
       {/* 2. editable form + original invoice side by side */}
       {bill && (
-        <div className="grid gap-4 lg:grid-cols-2">
-          <section className={card}>
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <section className={`${card} min-w-0`}>
             <h2 className={title}>{editingId ? "Invoice details — editing" : "Invoice details"}</h2>
 
             {/* vendor resolution — GSTIN match, name candidates, or create */}
@@ -928,8 +971,8 @@ export default function PurchaseBills() {
               </div>
             )}
             <div className="mt-1 overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
+              <table className="w-full text-sm max-md:block">
+                <thead className="max-md:hidden">
                   <tr>
                     <th className={th}>Invoice wording</th>
                     <th className={th}>Standard item</th>
@@ -943,7 +986,7 @@ export default function PurchaseBills() {
                     <th className={th}></th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody className="max-md:block">
                   {items.map((it, i) => {
                     const needItem = !it.item_id;
                     const needBrand = !it.brand_id;
@@ -951,21 +994,21 @@ export default function PurchaseBills() {
                     return (
                       <tr
                         key={i}
-                        className={"border-t border-slate-100 dark:border-slate-800 " + (needItem || needBrand ? "bg-amber-50/60" : "")}
+                        className={"border-t border-slate-100 dark:border-slate-800 max-md:mb-3 max-md:grid max-md:grid-cols-2 max-md:gap-x-3 max-md:gap-y-2 max-md:rounded-xl max-md:border max-md:p-3 " + (needItem || needBrand ? "bg-amber-50/60" : "")}
                         data-test="item_row"
                       >
-                        <td className={td}>
+                        <td className={`${ltd} max-md:col-span-2`} data-label="Invoice wording">
                           <input
                             data-test={"item_desc_" + i}
-                            className={`${tin} w-[260px]`}
+                            className={`${tin} w-[260px] max-md:w-full`}
                             value={it.description}
                             onChange={(e) => setItem(i, "description", e.target.value)}
                           />
                         </td>
-                        <td className={td}>
+                        <td className={`${ltd} max-md:col-span-2`} data-label="Standard item">
                           <select
                             data-test={"item_item_" + i}
-                            className={(needItem ? tinWarn : tin) + " w-[260px]"}
+                            className={(needItem ? tinWarn : tin) + " w-[260px] max-md:w-full"}
                             value={String(it.item_id || "")}
                             onChange={(e) => pickItem(i, e.target.value)}
                           >
@@ -1001,10 +1044,10 @@ export default function PurchaseBills() {
                             </div>
                           )}
                         </td>
-                        <td className={td}>
+                        <td className={`${ltd} max-md:col-span-2`} data-label="Brand">
                           <select
                             data-test={"item_brand_" + i}
-                            className={(needBrand ? tinWarn : tin) + " w-32"}
+                            className={(needBrand ? tinWarn : tin) + " w-32 max-md:w-full"}
                             value={String(it.brand_id || "")}
                             onChange={(e) => setItem(i, "brand_id", e.target.value)}
                           >
@@ -1018,57 +1061,57 @@ export default function PurchaseBills() {
                           {needItem && <div className="mt-0.5 text-xs text-amber-700">item?</div>}
                           {needBrand && !needItem && <div className="mt-0.5 text-xs text-amber-700">brand?</div>}
                         </td>
-                        <td className={td}>
+                        <td className={ltd} data-label="Qty">
                           <input
                             data-test={"item_qty_" + i}
                             type="number"
                             step="0.01"
                             inputMode="decimal"
-                            className={`${tin} w-24`}
+                            className={`${tin} w-24 max-md:w-full`}
                             value={it.quantity}
                             onChange={(e) => setItem(i, "quantity", e.target.value)}
                           />
                         </td>
-                        <td className={td}>
-                          <input data-test={"item_unit_" + i} className={`${tin} w-20`} value={it.unit} onChange={(e) => setItem(i, "unit", e.target.value)} />
+                        <td className={ltd} data-label="Unit">
+                          <input data-test={"item_unit_" + i} className={`${tin} w-20 max-md:w-full`} value={it.unit} onChange={(e) => setItem(i, "unit", e.target.value)} />
                         </td>
-                        <td className={td}>
+                        <td className={ltd} data-label="Rate">
                           <input
                             data-test={"item_rate_" + i}
                             type="number"
                             step="0.01"
                             inputMode="decimal"
-                            className={`${tin} w-28`}
+                            className={`${tin} w-28 max-md:w-full`}
                             value={it.rate}
                             onChange={(e) => setItem(i, "rate", e.target.value)}
                           />
                         </td>
-                        <td className={td}>
+                        <td className={ltd} data-label="Tax %">
                           <input
                             data-test={"item_tax_" + i}
                             type="number"
                             step="0.01"
                             inputMode="decimal"
-                            className={`${tin} w-20`}
+                            className={`${tin} w-20 max-md:w-full`}
                             value={it.tax_rate}
                             onChange={(e) => setItem(i, "tax_rate", e.target.value)}
                           />
                         </td>
-                        <td className={td}>
+                        <td className={ltd} data-label="Printed line total">
                           <input
                             data-test={"item_lt_" + i}
                             type="number"
                             step="0.01"
                             inputMode="decimal"
-                            className={`${tin} w-28`}
+                            className={`${tin} w-28 max-md:w-full`}
                             value={it.line_total}
                             onChange={(e) => setItem(i, "line_total", e.target.value)}
                           />
                         </td>
-                        <td className={`${td} text-right text-slate-400`}>
+                        <td className={`${ltd} text-right text-slate-400 max-md:text-left`} data-label="qty × rate">
                           {r2(n(it.quantity) * n(it.rate)).toLocaleString("en-IN")}
                         </td>
-                        <td className={td}>
+                        <td className={`${td} max-md:col-span-2 max-md:block max-md:px-0 max-md:text-right`}>
                           <button onClick={() => removeItem(i)} className="cursor-pointer text-rose-500 hover:underline" title="Remove line">
                             ✕
                           </button>
@@ -1145,7 +1188,7 @@ export default function PurchaseBills() {
             </p>
           </section>
 
-          <section className={card}>
+          <section className={`${card} min-w-0`}>
             <h2 className={title}>Original invoice</h2>
             <div className="mt-2 rounded-xl border border-slate-200 p-2 dark:border-slate-800">
               {fileKind === "image" ? (
