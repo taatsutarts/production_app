@@ -64,6 +64,7 @@ function Field({ label, children }) {
   );
 }
 
+const BUYER_STATE_CODE = "27"; // Maharashtra — decides CGST+SGST (same state) vs IGST (other state)
 function Row({ label, value }) {
   return (
     <div className="flex justify-between">
@@ -552,6 +553,7 @@ export default function PurchaseBills() {
         freight_charges: d.freight_charges ?? 0,
         tax_inclusive: d.tax_inclusive === true,
         discount_before_tax: d.discount_before_tax === true,
+        charges_tax_rate: d.charges_tax_rate ?? 0,
         grand_total: d.grand_total == null ? "" : d.grand_total,
         notes: "",
       };
@@ -611,6 +613,7 @@ export default function PurchaseBills() {
         freight_charges: data.bill.freight_charges ?? 0,
         tax_inclusive: data.bill.tax_inclusive === true,
         discount_before_tax: data.bill.discount_before_tax === true,
+        charges_tax_rate: data.bill.charges_tax_rate ?? 0,
         grand_total: data.bill.grand_total == null ? "" : data.bill.grand_total,
         notes: data.bill.notes || "",
       };
@@ -1061,13 +1064,18 @@ export default function PurchaseBills() {
         : bill.discount_type === "Rs"
           ? r2(n(bill.discount_value))
           : 0;
-    const taxTotal = r2(bill.discount_before_tax === true && subtotal > 0 ? taxRaw * (1 - discount / subtotal) : taxRaw);
+    const chargesTax = r2((n(bill.other_charges) + n(bill.freight_charges)) * (n(bill.charges_tax_rate) / 100));
+    const taxTotal = r2((bill.discount_before_tax === true && subtotal > 0 ? taxRaw * (1 - discount / subtotal) : taxRaw) + chargesTax);
+    // our invoices are in Maharashtra (state code 27): a Maharashtra supplier charges CGST + SGST (half
+    // each), any other state charges IGST
+    const gstin = String(bill.vendor_gstin || "").trim();
+    const interstate = gstin.length >= 2 && gstin.slice(0, 2) !== BUYER_STATE_CODE;
     const computed = r2(subtotal - discount + taxTotal + n(bill.other_charges) + n(bill.freight_charges));
     const mismatch =
       bill.grand_total !== "" &&
       bill.grand_total != null &&
       Math.abs(n(bill.grand_total) - computed) > 1;
-    return { subtotal, taxTotal, discount, computed, mismatch };
+    return { subtotal, taxTotal, chargesTax, interstate, discount, computed, mismatch };
   }, [bill, items]);
 
   // submission gates: vendor resolved + every line has a standard item + brand
@@ -1367,6 +1375,14 @@ export default function PurchaseBills() {
                 <select data-test="discount_before_tax" className={inp} value={bill.discount_before_tax ? "yes" : "no"} disabled={bill.discount_type === "none"} onChange={(e) => setBillF("discount_before_tax", e.target.value === "yes")}>
                   <option value="no">No — GST on the full value</option>
                   <option value="yes">Yes — GST on the value after discount</option>
+                </select>
+              </Field>
+              <Field label="GST % on freight / other charges">
+                <select data-test="charges_tax_rate" className={inp} value={String(bill.charges_tax_rate ?? 0)} onChange={(e) => setBillF("charges_tax_rate", Number(e.target.value))}>
+                  <option value="0">No GST on the charges</option>
+                  <option value="5">5% (CGST 2.5% + SGST 2.5%)</option>
+                  <option value="12">12% (CGST 6% + SGST 6%)</option>
+                  <option value="18">18% (CGST 9% + SGST 9%)</option>
                 </select>
               </Field>
               <Field label="Other charges">
@@ -1676,7 +1692,14 @@ export default function PurchaseBills() {
             <div className="mt-3 space-y-1 border-t border-slate-100 pt-3 text-sm dark:border-slate-800">
               <Row label={bill.tax_inclusive ? "Subtotal (before GST, split out of the rates)" : "Subtotal (Σ qty × rate)"} value={totals.subtotal} />
               {totals.discount > 0 && <Row label="Discount" value={-totals.discount} />}
-              <Row label="Tax total (GST)" value={totals.taxTotal} />
+              {totals.interstate ? (
+                <Row label="IGST" value={totals.taxTotal} />
+              ) : (
+                <>
+                  <Row label="CGST" value={r2(totals.taxTotal / 2)} />
+                  <Row label="SGST" value={r2(totals.taxTotal - r2(totals.taxTotal / 2))} />
+                </>
+              )}
               {n(bill.other_charges) > 0 && <Row label="Other charges" value={n(bill.other_charges)} />}
               {n(bill.freight_charges) > 0 && <Row label="Freight" value={n(bill.freight_charges)} />}
               <div className="flex justify-between font-semibold">

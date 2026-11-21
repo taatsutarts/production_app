@@ -16,6 +16,7 @@
 //   suggestions: [ { line, options: [ { id, item_name, score } ] } ] — cautious similarity
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
+import { syncTagOptions } from "@/lib/zoho";
 import { norm, suggestItems, suggestVendors, ZOHO_FIELD_COLS, isMissingColumn } from "@/lib/purchaseMatch";
 
 export const dynamic = "force-dynamic";
@@ -35,6 +36,7 @@ export async function POST(request) {
       const wide = await q("id,item_name,brand_type,uom," + ZOHO_FIELD_COLS);
       return isMissingColumn(wide.error) ? q("id,item_name,brand_type,uom") : wide;
     };
+    await syncTagOptions(); // Location list follows Zoho (at most every 10 minutes)
     const [itemsRes, brandsRes, vendorsRes, accountsRes, locationsRes] = await Promise.all([
       loadItems(),
       sb.from("brands").select("id,brand_name").order("brand_name"),

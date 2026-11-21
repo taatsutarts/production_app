@@ -44,7 +44,9 @@ function computeTotals(bill, items) {
       : bill.discount_type === "Rs"
         ? r2(num(bill.discount_value))
         : 0;
-  const taxTotal = r2(bill.discount_before_tax === true && subtotal > 0 ? taxRaw * (1 - discount / subtotal) : taxRaw);
+  // GST charged on the extra charges (vehicle / freight / other) — e.g. "Vehicle expenses 450 + CGST/SGST"
+  const chargesTax = (num(bill.other_charges) + num(bill.freight_charges)) * (num(bill.charges_tax_rate) / 100);
+  const taxTotal = r2((bill.discount_before_tax === true && subtotal > 0 ? taxRaw * (1 - discount / subtotal) : taxRaw) + chargesTax);
   const computed = r2(
     subtotal - discount + taxTotal + num(bill.other_charges) + num(bill.freight_charges)
   );
@@ -70,6 +72,13 @@ async function flagsOn() {
   const r = await sb.from("purchase_bills").select("tax_inclusive,discount_before_tax").limit(1);
   flagsCache = { on: !r.error, at: Date.now() };
   return flagsCache.on;
+}
+let chargeTaxCache = { on: null, at: 0 };
+async function chargeTaxOn() {
+  if (chargeTaxCache.on === true || (chargeTaxCache.on === false && Date.now() - chargeTaxCache.at < 15000)) return chargeTaxCache.on;
+  const r = await sb.from("purchase_bills").select("charges_tax_rate").limit(1);
+  chargeTaxCache = { on: !r.error, at: Date.now() };
+  return chargeTaxCache.on;
 }
 let grnCache = { on: null, at: 0 };
 async function grnOn() {
@@ -296,6 +305,7 @@ export async function POST(request) {
     const zoho = await zohoFieldsOn();
     const grn = await grnOn();
     const flags = await flagsOn();
+    const chargeTax = await chargeTaxOn();
     const gate = await validateSave(bill, items, zoho);
     if (gate.error) return NextResponse.json({ error: gate.error }, { status: 400 });
     // GRN No.: what was typed, else the next automatic number
@@ -312,6 +322,7 @@ export async function POST(request) {
         invoice_number: bill.invoice_number || null,
         ...(grn ? { grn_no: grnVal } : {}),
         ...(flags ? { tax_inclusive: bill.tax_inclusive === true, discount_before_tax: bill.discount_before_tax === true } : {}),
+        ...(chargeTax ? { charges_tax_rate: num(bill.charges_tax_rate) } : {}),
         invoice_date: bill.invoice_date || null,
         due_date: bill.due_date || null,
         discount_type:
@@ -434,6 +445,7 @@ export async function PUT(request) {
     const zoho = await zohoFieldsOn();
     const grn = await grnOn();
     const flags = await flagsOn();
+    const chargeTax = await chargeTaxOn();
     const gate = await validateSave(bill, items, zoho);
     if (gate.error) return NextResponse.json({ error: gate.error }, { status: 400 });
     // GRN No.: what was typed, else the one this bill already has, else the next automatic number
@@ -449,6 +461,7 @@ export async function PUT(request) {
         invoice_number: bill.invoice_number || null,
         ...(grn ? { grn_no: grnVal } : {}),
         ...(flags ? { tax_inclusive: bill.tax_inclusive === true, discount_before_tax: bill.discount_before_tax === true } : {}),
+        ...(chargeTax ? { charges_tax_rate: num(bill.charges_tax_rate) } : {}),
         invoice_date: bill.invoice_date || null,
         due_date: bill.due_date || null,
         discount_type:
