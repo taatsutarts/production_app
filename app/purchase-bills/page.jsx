@@ -96,7 +96,7 @@ const EMPTY_LINE = {
 // groups: [{ title, options: [{ value, label, hint? }] }]. The list opens in a portal with a fixed
 // position, so the line-items table's scroll box can never clip it. Every word typed must appear in
 // the option (any order); arrow keys + Enter pick; Escape closes.
-function SearchSelect({ testId, value, label, groups, onPick, placeholder, className, clearLabel }) {
+function SearchSelect({ testId, value, label, groups, onPick, placeholder, className, clearLabel, onCreate, createLabel }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [hi, setHi] = useState(0);
@@ -234,6 +234,19 @@ function SearchSelect({ testId, value, label, groups, onPick, placeholder, class
               className="w-full border-b border-slate-200 px-3 py-2 text-base outline-none"
             />
             <div className="overflow-y-auto">
+              {onCreate && (
+                <button
+                  type="button"
+                  data-test={testId + "_new"}
+                  onClick={() => {
+                    setOpen(false);
+                    onCreate(q.trim());
+                  }}
+                  className="w-full border-b border-slate-100 px-3 py-2 text-left text-sm font-medium text-emerald-700 hover:bg-emerald-50"
+                >
+                  ＋ {createLabel || "Add new"}{q.trim() ? " “" + q.trim() + "”" : ""}
+                </button>
+              )}
               {value && clearLabel && (
                 <button type="button" onClick={() => pick("")} className="w-full px-3 py-2 text-left text-sm text-rose-600 hover:bg-slate-50">
                   ✕ {clearLabel}
@@ -355,11 +368,18 @@ export default function PurchaseBills() {
   const [vOpen, setVOpen] = useState(false); // create-vendor form open
   const [vForm, setVForm] = useState({ vendor_name: "", gstin: "", phone: "", email: "", address: "" });
   const [vBusy, setVBusy] = useState(false);
+  // "＋ Add new item" from a line's Standard item picker: { line, item_name, brand_type, uom } or null
+  const [nItem, setNItem] = useState(null);
+  const [nItemBusy, setNItemBusy] = useState(false);
 
   /* ---------- saved bills ---------- */
   const [bills, setBills] = useState([]);
   const [billsQ, setBillsQ] = useState(""); // client-side search over the saved list
   const [billsStatus, setBillsStatus] = useState("all");
+  const [autoSync, setAutoSync] = useState(true); // Save = approve + send to Zoho (untick to keep a draft)
+  const [newBillId, setNewBillId] = useState(null); // the bill just saved: highlighted, kept on top
+  const billsRef = useRef(null);
+  const justSaved = useRef(null); // the saved row, kept in the list even if a re-read is a moment behind
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState("");
@@ -530,6 +550,8 @@ export default function PurchaseBills() {
         discount_value: d.discount_value == null ? "" : d.discount_value,
         other_charges: d.other_charges ?? 0,
         freight_charges: d.freight_charges ?? 0,
+        tax_inclusive: d.tax_inclusive === true,
+        discount_before_tax: d.discount_before_tax === true,
         grand_total: d.grand_total == null ? "" : d.grand_total,
         notes: "",
       };
@@ -587,6 +609,8 @@ export default function PurchaseBills() {
         discount_value: data.bill.discount_value == null ? "" : data.bill.discount_value,
         other_charges: data.bill.other_charges ?? 0,
         freight_charges: data.bill.freight_charges ?? 0,
+        tax_inclusive: data.bill.tax_inclusive === true,
+        discount_before_tax: data.bill.discount_before_tax === true,
         grand_total: data.bill.grand_total == null ? "" : data.bill.grand_total,
         notes: data.bill.notes || "",
       };
@@ -653,6 +677,61 @@ export default function PurchaseBills() {
       address: "",
     });
     setVOpen(true);
+  }
+
+  function openNewItem(i, typed) {
+    const it = items[i] || {};
+    const b = catalog.brands.find((x) => String(x.id) === String(it.brand_id));
+    setNItem({
+      line: i,
+      item_name: typed || (it.description || "").trim(),
+      brand_type: b ? b.brand_name : "",
+      uom: it.unit || "",
+    });
+  }
+  async function createItem(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!nItem) return;
+    setNItemBusy(true);
+    setErr("");
+    try {
+      const res = await fetch("/api/purchase-bills/items", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ item_name: nItem.item_name, brand_type: nItem.brand_type, uom: nItem.uom }),
+      });
+      const data = await res.json().catch(() => ({}));
+      let made = data.item;
+      if (res.status === 409 && data.existing) made = { ...data.existing, brand_type: nItem.brand_type || null };
+      else if (!res.ok) {
+        setErr(data.error || data.message || "Could not create the item.");
+        return;
+      }
+      const line = nItem.line;
+      const bt = made.brand_type === "Gourmaison" || made.brand_type === "Taatsu" ? made.brand_type : "";
+      setCatalog((c) =>
+        c.items.some((x) => String(x.id) === String(made.id))
+          ? c
+          : { ...c, items: [...c.items, made].sort((a, b) => String(a.item_name).localeCompare(String(b.item_name))) }
+      );
+      setItems((arr) =>
+        arr.map((it, j) => {
+          if (j !== line) return it;
+          const next = { ...it, item_id: String(made.id), item_name: made.item_name, match_how: "" };
+          if (!it.brand_id && bt) {
+            const b = catalog.brands.find((x) => x.brand_name === bt);
+            if (b) next.brand_id = String(b.id);
+          }
+          return next;
+        })
+      );
+      setNItem(null);
+      setMsg(res.status === 409 ? "This item already exists — selected the existing one." : "Item added: " + made.item_name);
+    } catch (e2) {
+      setErr("Could not create the item: " + e2.message);
+    } finally {
+      setNItemBusy(false);
+    }
   }
 
   async function createVendor(e) {
@@ -738,13 +817,51 @@ export default function PurchaseBills() {
         setMsg("");
         return;
       }
-      if (editingId) {
-        if (data.warning) setMsg("Bill updated — but: " + data.warning);
-        else setMsg("Bill updated.");
-      } else {
-        if (data.warning) setMsg("Saved as draft — but: " + data.warning);
-        else setMsg("Saved as draft.");
+      // show it in the list immediately; loadBills() below then re-reads the real list
+      if (data.bill && data.bill.id) {
+        justSaved.current = data.bill;
+        setBillsQ("");
+        setBillsStatus("all"); // a search/filter must not hide the bill that was just saved
+        setBills((prev) => [data.bill, ...prev.filter((x) => x.id !== data.bill.id)]);
+        setNewBillId(data.bill.id);
+        setTimeout(() => setNewBillId((cur) => (cur === data.bill.id ? null : cur)), 6000);
+        // on a phone the list is far below the form: bring it into view
+        setTimeout(() => billsRef.current && billsRef.current.scrollIntoView({ behavior: "smooth", block: "start" }), 150);
       }
+      const grnNote = data.bill && data.bill.grn_no ? " — GRN " + data.bill.grn_no : "";
+      const wasEditing = !!editingId;
+      // Zoho sync is the default: approve the saved bill, which sends it to Zoho in the same step
+      let syncNote = "";
+      let syncFailed = false;
+      if (autoSync && data.bill && data.bill.id) {
+        try {
+          const r2res = await fetch("/api/purchase-bills", {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id: data.bill.id, status: "approved" }),
+          });
+          const d2 = await r2res.json().catch(() => ({}));
+          if (!r2res.ok) {
+            syncFailed = true;
+            syncNote = "Zoho sync not done: " + (d2.error || "approve failed") + " — use Approve / Sync to Zoho in the list.";
+          } else if (d2.zoho && d2.zoho.ok) syncNote = "synced to Zoho." + (d2.zoho.error ? " (attachment: " + d2.zoho.error + ")" : "");
+          else if (d2.zoho && d2.zoho.reason === "already_synced") syncNote = "already in Zoho.";
+          else if (d2.zoho && d2.zoho.reason === "not_configured") syncNote = "approved (Zoho is not configured).";
+          else {
+            syncFailed = true;
+            syncNote = "Zoho sync failed: " + ((d2.zoho && d2.zoho.error) || "unknown error") + " — fix it and use Sync to Zoho in the list.";
+          }
+        } catch (e3) {
+          syncFailed = true;
+          syncNote = "Zoho sync failed: " + e3.message;
+        }
+      }
+      const what = wasEditing ? "Bill updated" : autoSync ? "Saved" + grnNote : "Saved as draft" + grnNote;
+      const full = what + (syncNote ? " — " + syncNote : ".") + (data.warning ? " (note: " + data.warning + ")" : "");
+      if (syncFailed) {
+        setErr(full);
+        setMsg("");
+      } else setMsg(full);
       clearForm(); // keeps the message above
       loadBills();
     } catch (e) {
@@ -758,9 +875,14 @@ export default function PurchaseBills() {
   /* ---------- saved bills: load / approve / zoho / delete ---------- */
   function loadBills() {
     setLoading(true);
-    fetch("/api/purchase-bills")
+    fetch("/api/purchase-bills", { cache: "no-store" })
       .then((r) => r.json())
-      .then((d) => setBills(d.bills || []))
+      .then((d) => {
+        const list = d.bills || [];
+        const js = justSaved.current;
+        // the fresh bill stays on top even if the server list was read a moment too early
+        setBills(js && !list.some((x) => x.id === js.id) ? [js, ...list] : list);
+      })
       .catch(() => setErr("Could not load the saved bills."))
       .finally(() => setLoading(false));
   }
@@ -922,16 +1044,24 @@ export default function PurchaseBills() {
   // live totals while reviewing (the server recomputes the same numbers on save)
   const totals = useMemo(() => {
     if (!bill) return null;
-    const subtotal = r2(items.reduce((a, it) => a + n(it.quantity) * n(it.rate), 0));
-    const taxTotal = r2(
-      items.reduce((a, it) => a + (n(it.quantity) * n(it.rate) * n(it.tax_rate)) / 100, 0)
-    );
+    const incl = bill.tax_inclusive === true;
+    let sub = 0;
+    let taxRaw = 0;
+    for (const it of items) {
+      const gross = n(it.quantity) * n(it.rate);
+      const t = n(it.tax_rate) / 100;
+      const base = incl ? gross / (1 + t) : gross;
+      sub += base;
+      taxRaw += base * t;
+    }
+    const subtotal = r2(sub);
     const discount =
       bill.discount_type === "%"
         ? r2((subtotal * n(bill.discount_value)) / 100)
         : bill.discount_type === "Rs"
           ? r2(n(bill.discount_value))
           : 0;
+    const taxTotal = r2(bill.discount_before_tax === true && subtotal > 0 ? taxRaw * (1 - discount / subtotal) : taxRaw);
     const computed = r2(subtotal - discount + taxTotal + n(bill.other_charges) + n(bill.freight_charges));
     const mismatch =
       bill.grand_total !== "" &&
@@ -1201,7 +1331,7 @@ export default function PurchaseBills() {
                 <input data-test="invoice_number" className={inp} value={bill.invoice_number} onChange={(e) => setBillF("invoice_number", e.target.value)} />
               </Field>
               <Field label="GRN No. (internal)">
-                <input data-test="grn_no" className={inp} value={bill.grn_no || ""} onChange={(e) => setBillF("grn_no", e.target.value)} placeholder="Goods receipt note number" />
+                <input data-test="grn_no" className={inp + " bg-slate-50 text-slate-500"} value={bill.grn_no || ""} readOnly placeholder="Assigned automatically when you save" />
               </Field>
               <Field label="Invoice date">
                 <input data-test="invoice_date" type="date" className={inp} value={bill.invoice_date} onChange={(e) => setBillF("invoice_date", e.target.value)} />
@@ -1226,6 +1356,18 @@ export default function PurchaseBills() {
                   disabled={bill.discount_type === "none"}
                   onChange={(e) => setBillF("discount_value", e.target.value)}
                 />
+              </Field>
+              <Field label="Rates include GST?">
+                <select data-test="tax_inclusive" className={inp} value={bill.tax_inclusive ? "yes" : "no"} onChange={(e) => setBillF("tax_inclusive", e.target.value === "yes")}>
+                  <option value="no">No — GST is added on top</option>
+                  <option value="yes">Yes — rates already include GST</option>
+                </select>
+              </Field>
+              <Field label="Discount taken before GST?">
+                <select data-test="discount_before_tax" className={inp} value={bill.discount_before_tax ? "yes" : "no"} disabled={bill.discount_type === "none"} onChange={(e) => setBillF("discount_before_tax", e.target.value === "yes")}>
+                  <option value="no">No — GST on the full value</option>
+                  <option value="yes">Yes — GST on the value after discount</option>
+                </select>
               </Field>
               <Field label="Other charges">
                 <input data-test="other_charges" type="number" step="0.01" className={inp} value={bill.other_charges} onChange={(e) => setBillF("other_charges", e.target.value)} />
@@ -1344,6 +1486,8 @@ export default function PurchaseBills() {
                             label={known ? known.item_name : it.item_id ? it.item_name || "(item " + it.item_id + ")" : ""}
                             groups={itemGroupsFor(i)}
                             onPick={(id) => pickItem(i, id)}
+                            createLabel="Add new item"
+                            onCreate={(typed) => openNewItem(i, typed)}
                           />
                           {it.match_how === "mapping" && (
                             <div className="mt-0.5 text-xs text-emerald-600" data-test={"item_how_" + i}>
@@ -1490,9 +1634,47 @@ export default function PurchaseBills() {
               ＋ Add line
             </button>
 
+            {nItem && (
+              <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/40 p-4" data-test="new_item_modal">
+                <form onSubmit={createItem} className="w-full max-w-md space-y-3 rounded-2xl bg-white p-4 shadow-xl">
+                  <div className="text-base font-semibold">Add a new item</div>
+                  <Field label="Item name *">
+                    <input
+                      data-test="new_item_name"
+                      className={inp}
+                      value={nItem.item_name}
+                      onChange={(e) => setNItem({ ...nItem, item_name: e.target.value })}
+                      required
+                      autoFocus
+                    />
+                  </Field>
+                  <Field label="Brand">
+                    <select data-test="new_item_brand" className={inp} value={nItem.brand_type} onChange={(e) => setNItem({ ...nItem, brand_type: e.target.value })}>
+                      <option value="">— not decided —</option>
+                      <option value="Gourmaison">Gourmaison</option>
+                      <option value="Taatsu">Taatsu</option>
+                      <option value="Both">Both</option>
+                    </select>
+                  </Field>
+                  <Field label="Unit (optional)">
+                    <input data-test="new_item_uom" className={inp} value={nItem.uom} onChange={(e) => setNItem({ ...nItem, uom: e.target.value })} placeholder="kg, pcs, box…" />
+                  </Field>
+                  <div className="text-xs text-slate-500">The account, ITC and location you pick on this line are remembered for the item when you save the bill.</div>
+                  <div className="flex justify-end gap-2">
+                    <button type="button" className={btnGhost} onClick={() => setNItem(null)}>
+                      Cancel
+                    </button>
+                    <button type="submit" disabled={nItemBusy} className={btn} data-test="new_item_save">
+                      {nItemBusy ? "Adding…" : "Add item"}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
+
             {/* totals + mismatch warning */}
             <div className="mt-3 space-y-1 border-t border-slate-100 pt-3 text-sm dark:border-slate-800">
-              <Row label="Subtotal (Σ qty × rate)" value={totals.subtotal} />
+              <Row label={bill.tax_inclusive ? "Subtotal (before GST, split out of the rates)" : "Subtotal (Σ qty × rate)"} value={totals.subtotal} />
               {totals.discount > 0 && <Row label="Discount" value={-totals.discount} />}
               <Row label="Tax total (GST)" value={totals.taxTotal} />
               {n(bill.other_charges) > 0 && <Row label="Other charges" value={n(bill.other_charges)} />}
@@ -1527,12 +1709,16 @@ export default function PurchaseBills() {
                       : ""
                 }
               >
-                {saving ? "Saving…" : editingId ? "💾 Save changes" : "💾 Save draft"}
+                {saving ? "Saving…" : autoSync ? (editingId ? "💾 Save changes & sync to Zoho" : "💾 Save & sync to Zoho") : editingId ? "💾 Save changes" : "💾 Save draft"}
               </button>
               <button onClick={discard} className={btnGhost} data-test="discard">
                 ↩️ Discard
               </button>
               {matchBusy && <span className={mute}>matching items…</span>}
+              <label className="flex cursor-pointer items-center gap-2 text-sm" data-test="auto_sync_label">
+                <input type="checkbox" data-test="auto_sync" checked={autoSync} onChange={(e) => setAutoSync(e.target.checked)} />
+                Sync to Zoho when saving
+              </label>
             </div>
             {bill && (!vendorOk || unresolved > 0) && (
               <p className="mt-1 text-xs font-medium text-amber-700" data-test="save_blockers">
@@ -1541,14 +1727,14 @@ export default function PurchaseBills() {
               </p>
             )}
             <p className={`${mute} mt-2`}>
-              Nothing is submitted automatically — review, save as draft, then approve from the list below.
+              Saving also approves the bill and sends it to Zoho. Untick “Sync to Zoho when saving” to keep it as a draft and approve it later from the list below.
             </p>
           </section>
         </div>
       )}
 
       {/* 3. saved bills */}
-      <section className={card}>
+      <section className={card} ref={billsRef}>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <h2 className={title}>Saved bills</h2>
@@ -1575,8 +1761,8 @@ export default function PurchaseBills() {
           </div>
         </div>
         <div className="mt-2 overflow-x-auto" data-test="bills_table">
-          <table className="w-full text-sm">
-            <thead>
+          <table className="w-full text-sm max-md:block">
+            <thead className="max-md:hidden">
               <tr>
                 <th className={th}>Vendor</th>
                 <th className={th}>Invoice</th>
@@ -1588,30 +1774,34 @@ export default function PurchaseBills() {
                 <th className={th}>Actions</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className="max-md:block">
               {shownBills.map((b) => (
-                <tr key={b.id} className="border-t border-slate-100 dark:border-slate-800" data-test="bill_row">
-                  <td className={td}>
+                <tr
+                  key={b.id}
+                  className={"border-t border-slate-100 dark:border-slate-800 max-md:mb-3 max-md:grid max-md:grid-cols-2 max-md:gap-x-3 max-md:gap-y-2 max-md:rounded-xl max-md:border max-md:p-3 " + (b.id === newBillId ? "bg-emerald-50 ring-2 ring-emerald-300" : "")}
+                  data-test="bill_row"
+                >
+                  <td className={`${td} max-md:col-span-2 max-md:block max-md:px-0 max-md:py-0 max-md:text-base max-md:font-semibold`}>
                     {b.vendor_name || "—"}
                     <div className="text-xs text-slate-400">{b.cost_center || ""}</div>
                   </td>
-                  <td className={td}>
+                  <td className={ltd} data-label="Invoice">
                     {b.invoice_number || "—"}
                     <div className="text-xs text-slate-400">{b.vendor_gstin || ""}</div>
                   </td>
-                  <td className={td} data-test="bill_grn">
+                  <td className={ltd} data-label="GRN No." data-test="bill_grn">
                     {b.grn_no ? b.grn_no : <span className="text-xs text-amber-600">no GRN</span>}
                   </td>
-                  <td className={td}>{b.invoice_date || "—"}</td>
-                  <td className={td}>{fm(b.computed_total)}</td>
-                  <td className={td}>
+                  <td className={ltd} data-label="Date">{b.invoice_date || "—"}</td>
+                  <td className={ltd} data-label="Grand total">{fm(b.computed_total)}</td>
+                  <td className={ltd} data-label="Status">
                     <Badge t={b.status === "approved" ? "green" : "slate"}>{b.status}</Badge>
                   </td>
-                  <td className={td}>
+                  <td className={`${ltd} max-md:col-span-2`} data-label="Zoho">
                     <Badge t={ZOHO_C[b.zoho_sync_status] || "slate"}>{b.zoho_sync_status}</Badge>
                     {b.zoho_sync_error && <div className="text-xs text-rose-500">{b.zoho_sync_error.slice(0, 80)}</div>}
                   </td>
-                  <td className={td}>
+                  <td className={`${td} max-md:col-span-2 max-md:block max-md:px-0 max-md:py-0`}>
                     <div className="flex flex-wrap gap-2">
                       <button disabled={busyId === b.id} onClick={() => editBill(b)} className={btnGhost} data-test="edit">
                         ✏️ Edit
@@ -1635,7 +1825,7 @@ export default function PurchaseBills() {
               ))}
               {!loading && shownBills.length === 0 && (
                 <tr>
-                  <td className={td} colSpan={8}>
+                  <td className={`${td} max-md:block`} colSpan={9}>
                     <span className={mute}>
                       {bills.length === 0
                         ? "No bills yet — upload an invoice above."

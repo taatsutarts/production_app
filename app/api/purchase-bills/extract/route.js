@@ -49,10 +49,12 @@ Extract exactly the JSON shape below. Rules:
 - cost_center: this company's cost centers (brands/sections) are: ${cc.length ? cc.join(", ") : "(none configured yet)"}. For EACH line, infer which brand it belongs to by comparing THAT line's description with those names (one invoice can contain items for several brands). If the list is empty or the line is not clearly one of them, return null for that line — do not guess.
 - List EVERY line separately, in invoice order — never merge or skip lines, even on long invoices where the same product repeats.
 - subtotal, tax_total and grand_total: the totals AS PRINTED on the invoice (null if one is not printed).
-- other_charges: extra charges that are not GST and not freight (packing, handling, round off...). 0 if none appear.
+- other_charges: extra charges that are not GST and not freight (packing, handling, round off...). 0 if none appear. A lone figure under the line-item columns is usually the TOTAL QUANTITY — that is NOT a charge; ignore it.
+- tax_inclusive: true when the printed rates already INCLUDE GST (the invoice says "GST is included in the selling price", or each line's Amount equals taxable value + tax and the taxable value is smaller than qty x rate). false when GST is added on top of the rates.
+- discount_before_tax: true when the GST summary is calculated on the goods value AFTER the discount; false if GST is on the full value.
 - freight_charges: logistics / transport / freight charge. 0 if none appear.
 Return JSON only:
-{"vendor_name": null, "vendor_gstin": null, "invoice_number": null, "invoice_date": null, "due_date": null, "discount_type": null, "discount_value": null, "items": [{"description": null, "quantity": 0, "unit": null, "rate": 0, "tax_rate": 0, "line_total": null, "cost_center": null}], "subtotal": null, "tax_total": null, "grand_total": null, "other_charges": 0, "freight_charges": 0}`;
+{"vendor_name": null, "vendor_gstin": null, "invoice_number": null, "invoice_date": null, "due_date": null, "discount_type": null, "discount_value": null, "items": [{"description": null, "quantity": 0, "unit": null, "rate": 0, "tax_rate": 0, "line_total": null, "cost_center": null}], "subtotal": null, "tax_total": null, "grand_total": null, "other_charges": 0, "freight_charges": 0, "tax_inclusive": false, "discount_before_tax": false}`;
 }
 
 class ExtractError extends Error {}
@@ -169,6 +171,8 @@ export async function POST(request) {
       grand_total: num(d.grand_total),
       other_charges: num(d.other_charges) ?? 0,
       freight_charges: num(d.freight_charges) ?? 0,
+      tax_inclusive: d.tax_inclusive === true,
+      discount_before_tax: d.discount_before_tax === true && d.discount_type != null,
       items,
     };
     return NextResponse.json({ data: out });

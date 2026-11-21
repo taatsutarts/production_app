@@ -23,17 +23,28 @@ const r2 = (x) => Math.round(x * 100) / 100;
 // subtotal = sum(qty x rate); tax = sum(qty x rate x tax%); computed_total adds the
 // discount (-% or -Rs), other charges and freight. The printed grand_total is stored
 // separately for review — the page shows a warning badge when the two disagree.
+// Two optional switches (see supabase_migration_bill_tax_options.sql): tax_inclusive = the printed rates
+// already contain GST (subtotal and tax are then split out of qty x rate); discount_before_tax = GST is
+// charged on what is left after the discount. The page runs the same formula.
 function computeTotals(bill, items) {
-  const subtotal = r2(items.reduce((a, it) => a + num(it.quantity) * num(it.rate), 0));
-  const taxTotal = r2(
-    items.reduce((a, it) => a + (num(it.quantity) * num(it.rate) * num(it.tax_rate)) / 100, 0)
-  );
+  const incl = bill.tax_inclusive === true;
+  let subtotal = 0;
+  let taxRaw = 0;
+  for (const it of items) {
+    const gross = num(it.quantity) * num(it.rate);
+    const t = num(it.tax_rate) / 100;
+    const base = incl ? gross / (1 + t) : gross;
+    subtotal += base;
+    taxRaw += base * t;
+  }
+  subtotal = r2(subtotal);
   const discount =
     bill.discount_type === "%"
       ? r2((subtotal * num(bill.discount_value)) / 100)
       : bill.discount_type === "Rs"
         ? r2(num(bill.discount_value))
         : 0;
+  const taxTotal = r2(bill.discount_before_tax === true && subtotal > 0 ? taxRaw * (1 - discount / subtotal) : taxRaw);
   const computed = r2(
     subtotal - discount + taxTotal + num(bill.other_charges) + num(bill.freight_charges)
   );
@@ -53,6 +64,13 @@ const ITC_VALUES = ["eligible", "ineligible"];
 
 // GRN No. — internal tracking only (never sent to Zoho). Stored once supabase_migration_grn_no.sql
 // has added the column; until then bills save exactly as before.
+let flagsCache = { on: null, at: 0 };
+async function flagsOn() {
+  if (flagsCache.on === true || (flagsCache.on === false && Date.now() - flagsCache.at < 15000)) return flagsCache.on;
+  const r = await sb.from("purchase_bills").select("tax_inclusive,discount_before_tax").limit(1);
+  flagsCache = { on: !r.error, at: Date.now() };
+  return flagsCache.on;
+}
 let grnCache = { on: null, at: 0 };
 async function grnOn() {
   if (grnCache.on === true || (grnCache.on === false && Date.now() - grnCache.at < 15000)) return grnCache.on;
@@ -60,7 +78,18 @@ async function grnOn() {
   grnCache = { on: !r.error, at: Date.now() };
   return grnCache.on;
 }
-const grnField = (bill, on) => (on ? { grn_no: String(bill.grn_no || "").trim() || null } : {});
+// The next GRN (0001, 0002, ...): the SQL counter once supabase_migration_grn_auto.sql has run, else the
+// highest purely numeric GRN + 1 — the same numbers, so switching over is seamless.
+async function nextGrn() {
+  const r = await sb.rpc("next_grn");
+  if (!r.error && r.data) return String(r.data);
+  const { data } = await sb.from("purchase_bills").select("grn_no").not("grn_no", "is", null).limit(10000);
+  let max = 0;
+  for (const row of data || []) if (/^\d{1,9}$/.test(row.grn_no || "")) max = Math.max(max, Number(row.grn_no));
+  return String(max + 1).padStart(4, "0");
+}
+const grnDuplicate = (e) => !!e && e.code === "23505" && /grn/i.test(e.message || "");
+const GRN_DUP = { error: "duplicate_grn", message: "This GRN No. is already used by another bill." };
 
 // the four Zoho fields of a saved line (the account name comes from the table, never the browser)
 const zohoLineFields = (it, on, gate) =>
@@ -235,7 +264,7 @@ export async function GET(request) {
     .order("created_at", { ascending: false })
     .limit(200);
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-  return NextResponse.json({ bills: data || [] });
+  return NextResponse.json({ bills: data || [] }, { headers: { "Cache-Control": "no-store" } });
 }
 
 export async function POST(request) {
@@ -266,8 +295,11 @@ export async function POST(request) {
     // server is the referee: vendor resolved + every line has a real item + brand
     const zoho = await zohoFieldsOn();
     const grn = await grnOn();
+    const flags = await flagsOn();
     const gate = await validateSave(bill, items, zoho);
     if (gate.error) return NextResponse.json({ error: gate.error }, { status: 400 });
+    // GRN No.: what was typed, else the next automatic number
+    const grnVal = grn ? await nextGrn() : null; // always automatic — a typed value is ignored
 
     // 1. save the bill first — an external failure later must never lose the invoice
     const { data: saved, error: billErr } = await sb
@@ -278,7 +310,8 @@ export async function POST(request) {
         vendor_gstin: bill.vendor_gstin || null,
         cost_center: bill.cost_center || null,
         invoice_number: bill.invoice_number || null,
-        ...grnField(bill, grn),
+        ...(grn ? { grn_no: grnVal } : {}),
+        ...(flags ? { tax_inclusive: bill.tax_inclusive === true, discount_before_tax: bill.discount_before_tax === true } : {}),
         invoice_date: bill.invoice_date || null,
         due_date: bill.due_date || null,
         discount_type:
@@ -297,6 +330,7 @@ export async function POST(request) {
       })
       .select()
       .single();
+    if (grnDuplicate(billErr)) return NextResponse.json(GRN_DUP, { status: 409 });
     if (billErr) return NextResponse.json({ error: billErr.message }, { status: 500 });
 
     // 2. the line items (roll the bill back if this fails — no empty bills)
@@ -399,8 +433,11 @@ export async function PUT(request) {
     // server is the referee (same rules as a new bill)
     const zoho = await zohoFieldsOn();
     const grn = await grnOn();
+    const flags = await flagsOn();
     const gate = await validateSave(bill, items, zoho);
     if (gate.error) return NextResponse.json({ error: gate.error }, { status: 400 });
+    // GRN No.: what was typed, else the one this bill already has, else the next automatic number
+    const grnVal = grn ? existing.grn_no || (await nextGrn()) : null; // keeps its number; old bills without one get the next
 
     const { error: upErr } = await sb
       .from("purchase_bills")
@@ -410,7 +447,8 @@ export async function PUT(request) {
         vendor_gstin: bill.vendor_gstin || null,
         cost_center: bill.cost_center || null,
         invoice_number: bill.invoice_number || null,
-        ...grnField(bill, grn),
+        ...(grn ? { grn_no: grnVal } : {}),
+        ...(flags ? { tax_inclusive: bill.tax_inclusive === true, discount_before_tax: bill.discount_before_tax === true } : {}),
         invoice_date: bill.invoice_date || null,
         due_date: bill.due_date || null,
         discount_type:
@@ -427,6 +465,7 @@ export async function PUT(request) {
         notes: bill.notes || null,
       })
       .eq("id", id);
+    if (grnDuplicate(upErr)) return NextResponse.json(GRN_DUP, { status: 409 });
     if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 });
 
     // replace the line items wholesale — but restore the old ones if the insert fails
